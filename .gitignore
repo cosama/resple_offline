@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+dist/
+
+# Native/CMake builds
+build/
+_build/
+cmake-build-*/
+_skbuild/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+.ninja_deps
+.ninja_log
+*.so
+*.dylib
+*.dll
+
+# Local editor and OS state
+.idea/
+.vscode/
+*~
+.DS_Store

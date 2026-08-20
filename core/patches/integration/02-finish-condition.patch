@@ -1,0 +1,20 @@
+--- src/RESPLE.cpp
++++ src/RESPLE.cpp
+@@ -1,4 +1,5 @@
+ #include <rclcpp/rclcpp.hpp>
++#include "resple_bridge/offline_bridge.hpp"
+ #include <std_msgs/msg/int64.hpp>
+ #include <std_msgs/msg/bool.hpp>
+ #include <sensor_msgs/msg/imu.hpp>
+@@ -86,7 +87,10 @@
+         rclcpp::Rate rate(20);
+         int64_t max_spl_knots = 0;
+         int64_t t_last_map_upd = 0;
+-        while (true) {      
++        // resple_bridge: upstream's loop has no exit condition (real ROS
++        // nodes are killed, not joined). finish_requested() lets the bridge
++        // stop this thread deterministically once input has drained.
++        while (!resple_bridge::finish_requested()) {
+             for (auto& [lidar_name, lidar_data] : lidars_data) {
+                 while (!lidar_data.t_buff.empty()) {
+                     pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_frame(new pcl::PointCloud<pcl::PointXYZINormal>());
