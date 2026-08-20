@@ -2,10 +2,10 @@
 
 // Minimal replacement for rclcpp/rclcpp.hpp.
 //
-// RESPLE.cpp (staged, patched only for member visibility -- see
-// patches/integration/01-bridge-visibility.patch) compiles against this
-// shim unmodified: rclcpp::Node's constructor/param/pub/sub surface stays
-// structurally the same as real rclcpp, but:
+// RESPLE.cpp (staged and patched -- see patches/integration/, three small
+// patches: member visibility, a loop exit condition, and an ikd-tree rebuild
+// barrier) compiles against this shim: rclcpp::Node's constructor/param/pub/
+// sub surface stays structurally the same as real rclcpp, but:
 //
 //   - create_subscription() is a no-op placeholder. This bridge never drives
 //     sensor data through RESPLE's own ROS callbacks -- it injects directly
@@ -20,9 +20,9 @@
 //     realized entirely in this compat layer rather than by patching
 //     RESPLE.cpp's publish call sites.
 //   - parameters are a simple typed store the bridge pre-populates
-//     (Node::set_parameter) before RESPLE's constructor runs, tracking which
-//     keys were bridge-provided vs. fell back to a declared default, for
-//     parameter-audit reporting.
+//     (Node::set_parameter) before RESPLE's constructor runs. was_provided()
+//     lets the bridge tell a bridge-set key from one that fell back to
+//     upstream's declared default.
 //   - Rate::sleep() is a short fixed poll, not real hz-paced sleeping: this
 //     bridge wants processData's wait loop to spin fast, not at wall-clock
 //     20 Hz, so offline replay is not throttled to real time.
@@ -94,14 +94,6 @@ class Node {
     std::lock_guard<std::mutex> lock(mutex_);
     return provided_.count(key) != 0;
   }
-  bool was_read(const std::string& key) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return read_.count(key) != 0;
-  }
-  std::set<std::string> fallback_keys() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return fallback_;
-  }
 
   // --- rclcpp::Node parameter surface RESPLE.cpp/CommonUtils::readParam use ---
   bool has_parameter(const std::string& key) const {
@@ -119,10 +111,7 @@ class Node {
   template <typename T>
   T declare_parameter(const std::string& key, const T& default_value) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!params_.count(key)) {
-      params_[key] = default_value;
-      fallback_.insert(key);
-    }
+    if (!params_.count(key)) params_[key] = default_value;
     return *std::any_cast<T>(&params_[key]);
   }
 
@@ -131,7 +120,6 @@ class Node {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = params_.find(key);
     if (it == params_.end()) return false;
-    read_.insert(key);
     if (const T* typed = std::any_cast<T>(&it->second)) {
       out = *typed;
       return true;
@@ -166,8 +154,6 @@ class Node {
   mutable std::mutex mutex_;
   std::unordered_map<std::string, std::any> params_;
   std::set<std::string> provided_;
-  std::set<std::string> fallback_;
-  mutable std::set<std::string> read_;
 };
 
 class Rate {

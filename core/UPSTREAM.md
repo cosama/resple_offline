@@ -22,9 +22,9 @@ map insert, FOV box segmentation -- same FAST-LIO lineage as DALI-SLAM's
 publishers). Unlike DALI's upstream, this isn't already split into a
 separate `io.cpp`.
 
-Rather than hand-splitting that file, this bridge compiles it **unmodified**
-against a compat `rclcpp` shim (`cpp/compat/`) that structurally replaces the
-ROS graph:
+Rather than hand-splitting that file, this bridge stages it with the small
+patch series below and compiles it against a compat `rclcpp` shim that
+structurally replaces the ROS graph:
 
 - **Parameters**: `rclcpp::Node`'s param store is bridge-populated before
   RESPLE's constructor runs (`Node::set_parameter<T>`), typed exactly as
@@ -33,15 +33,20 @@ ROS graph:
   `cpp/bindings.cpp`'s `apply_parameters`/`configure_lidar` set every key
   with its exact upstream C++ type rather than sniffing types from a generic
   dict.
-- **Sensor input**: `create_subscription<T>()` is a no-op -- the bridge never
-  drives data through RESPLE's own per-sensor callbacks (they still compile,
-  since their addresses are taken in the constructor, but are never invoked).
-  Instead `RespleOdometry::push_imu`/`push_lidar` inject directly into the
-  *same buffers* those callbacks would have filled (`imu_int_buff`,
-  `lidars_data[type].{pc_buff,t_buff}`), replicating each callback's own
-  blind-range filter and ms-offset intensity encoding at the injection site.
-  Everything downstream -- `processData`'s deskew/PointData construction,
-  the IEKF update, ikd-tree maintenance -- runs as upstream wrote it.
+- **Sensor input**: `create_subscription<T>()` is a no-op. Input is the
+  benchmark's canonical/preprocessed sweep representation, and injection
+  begins at RESPLE's internal `imu_int_buff` and
+  `lidars_data[type].{pc_buff,t_buff}` buffers rather than at ROS sensor
+  callbacks. `push_lidar` reproduces `ousterLidarCallback`'s per-point filter
+  chain in the same order and against the same reference values: raw-index
+  `point_filter_num`, blind range, the strictly-increasing absolute-stamp test
+  against the previous frame's last *kept* point (upstream's `static int64_t
+  last_t_ns`), ms relative-time encoding in `intensity`, reflectivity in
+  `curvature`, and the Ouster `lidar_time_offset` shift. `blind` is read from
+  the config RESPLE itself parsed, not passed in alongside it. Livox line/tag
+  packet fields do not exist in the prepared schema and are not synthesized.
+  Everything downstream -- `processData`'s PointData construction, IEKF
+  update, and map maintenance -- remains upstream logic.
 - **Results**: `create_publisher<T>()` returns a `Publisher<T>` whose
   `publish()` forwards to a bridge-registered capture callback
   (`Publisher<T>::capture_slot()`). This is how the bridge observes init
@@ -55,27 +60,30 @@ ROS graph:
   the same technique `frameworks/voxel_slam` uses) rather than linking it as
   a second object file, which would ODR-violate on those globals.
 
-This means the only patches needed are visibility and a shutdown hook --
-see below -- not a hand-authored split of ROS I/O vs. algorithm body.
+This avoids a hand-authored split of ROS I/O from the algorithm body.
 
 ## Patch series (`patches/integration/`)
 
 | Patch | What |
 |---|---|
 | `01-bridge-visibility.patch` | Widens `RESPLE`'s `private:` section (buffers, `spline`, callbacks) to `public:` so `cpp/bindings.cpp` can inject sensor data and read spline state from outside the class. No behavior change. |
-| `02-finish-condition.patch` | `processData()`'s loop is `while (true)` upstream -- real ROS nodes are killed, not joined, so there is no exit condition at all. Adds one `#include` and changes the loop condition to `!resple_bridge::finish_requested()`, a bridge-owned atomic, so `RespleOdometry::finish()` can stop the worker thread deterministically instead of relying on process teardown. |
+| `02-finish-condition.patch` | `processData()`'s loop is `while (true)` upstream -- real ROS nodes are killed, not joined, so there is no exit condition at all. Gives it a state-based one: the worker stops after the first pass that *began* with input closed and moved nothing. The flag is sampled at the top of the pass, never at the bottom, so a push landing after the pass scanned the buffers cannot be dropped. Also pops the raw queues under their own mutex, notifies the bridge on each dequeue (this is what releases producer backpressure), and calls the barrier from patch 03. |
+| `03-deterministic-ikdtree-rebuild.patch` | Ports DALI-SLAM's compatible ikd-tree rebuild quiescence barrier and initializes the rebuild thread handle. The processing loop waits at each measurement-batch boundary so correspondence searches never run against an in-flight background rebuild. |
 
 ## Known limitations / open validation
 
-- **Trajectory sampling is a bridge judgment call, not verified against
-  upstream's own convention.** RESPLE publishes incremental *spline control
-  points* (`est_window`/`estimate_msgs::msg::Estimate`), not one pose per
-  processed sweep like DALI's `/Odometry`. This bridge samples
-  `spline->itpPosition/itpQuaternion` once per new knot, one knot interval
-  behind the leading edge. The upstream remote has a `feature/benchmark`
-  branch that adds a TUM-trajectory-export service -- it was not inspected
-  before writing this bridge and should be read to confirm (or correct) the
-  sampling convention before trusting exported trajectories quantitatively.
+- **Trajectory sampling**: RESPLE publishes incremental spline control points,
+  so publication timing is not authoritative. After the worker fully drains
+  and joins, the bridge resamples the finalized spline at its knot interval in
+  the benchmark's world-to-body convention. This follows the finalized-spline
+  strategy on upstream's `feature/benchmark` branch while retaining body
+  rather than that branch's optional lidar-extrinsic output. Both ends of
+  `[minTimeNs(), maxTimeNs()]` are excluded (`spline_pose_window` in
+  `bindings.cpp`, shared with the live capture slot): the leading interval is
+  backward extrapolation into the idle knots, and the trailing one never
+  receives a measurement update because `collectMeasurements()` needs data
+  beyond `maxTimeNs() + dt_ns` to form a batch. That trailing partial batch is
+  reported as `metrics()["residual_points"]`.
 - **Real-dataset run done; no real-ROS2 parity run.** This sandbox has no
   ROS2 (Humble) install, so output has not been compared against upstream's
   own supported runtime. It has been run end-to-end on a real ~287 s
@@ -118,29 +126,23 @@ see below -- not a hand-authored split of ROS I/O vs. algorithm body.
   Still run the ARCHITECTURE.md validation ladder's bounded-real-data-parity
   step against a real ROS2 build (upstream's own `Dockerfile`) before
   trusting this for benchmark numbers.
-- **Determinism: one bug found and fixed, ikd-tree race not yet ruled out.**
-  `RespleOdometry::finish()` originally set the bridge's shutdown flag
-  immediately, but `processData()`'s loop only checks it between full drain
-  passes -- pushing a whole synthetic dataset (which, with no backpressure
-  wait ever triggered, can outrun the worker thread) and calling `finish()`
-  right after could stop the worker mid-drain and silently lose already-
-  pushed sweeps. This produced actually-observed run-to-run differences in
-  poses-committed and the final pose on an identical synthetic input.
-  `shutdown()` now waits for the mutex-protected per-lidar sweep queue to
-  empty plus a fixed grace period before signalling finish; 3 repeated runs
-  of the box-room synthetic scene (`core/tests/synthetic.py`) now produce
-  bit-identical trajectories. The grace-period wait is not watertight under
-  extreme load (`pt_buff`, processData's internal per-point queue, has no
-  mutex of its own to poll safely from the shutdown thread) -- tighten if a
-  real dataset run ever reproduces the original symptom.
-  ikd-Tree separately runs a background rebuild thread (confirmed:
-  importing `_core` alone starts and stops one at static init) -- the same
-  lineage that caused DA-LIO's offline-replay nondeterminism
-  (`dali-slam-nondeterminism-race` in project memory). DALI's fix
-  (`patches/fixes/05-deterministic-ikdtree-rebuild.patch` +
-  `integration/05-event-driven-loop.patch` there) was not ported here; the
-  synthetic determinism result above does not rule this out on a larger,
-  slower, real dataset where rebuilds are actually triggered mid-sweep.
+- **Determinism**: three known scheduler-dependent inputs are closed off.
+  (1) Completion is state-based -- input closure sampled at pass start, not a
+  queue-depth observation plus grace sleep -- and producer backpressure waits
+  on worker progress rather than a wall clock. (2) The ikd-tree rebuild
+  barrier removes the correspondence/rebuild scheduling race (scope caveat in
+  the patch header). (3) `push_lidar` refuses a first sweep preceded by fewer
+  than 15 IMU samples: `initialization()` averages `std::min(15,
+  imu_buff.size())` samples for gravity, and below 15 that count depends on
+  how far the producer ran before the worker reached init, which would make
+  the initial orientation -- and the whole trajectory -- scheduler-dependent.
+  Batch composition itself is *not* timing-dependent: `collectMeasurements()`
+  cuts on a spline-derived time window, and the OpenMP loops in `Estimator.h`
+  are element-wise writes with serial assembly, so no FP-reduction ordering is
+  involved. `core/tests/test_lifecycle.py` asserts bit-identical trajectories
+  over 3 subprocess runs of the synthetic scene. Large real-data repeated
+  replay is still recommended: that scene may not trigger large subtree
+  rebuilds.
 
 ## Upgrade procedure
 

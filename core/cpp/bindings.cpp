@@ -3,18 +3,19 @@
 // Design: RESPLE.cpp (staged + patched, see patches/integration/) is
 // #included directly below, giving this translation unit access to the
 // RESPLE class with its buffers made public (01-bridge-visibility.patch).
-// Sensor data is injected directly into the exact same per-lidar/IMU buffers
-// RESPLE's own ROS callbacks would have filled -- ousterLidarCallback and
-// friends are compiled (their addresses are taken in RESPLE's constructor)
-// but never invoked, so RESPLE's own downsample/PointData construction and
-// processData() estimator loop run completely unmodified. Publishers become
-// hooks via the compat rclcpp::Publisher<T>::capture_slot() mechanism (see
-// compat/rclcpp/rclcpp.hpp) rather than by patching publish call sites.
+// Canonical/preprocessed sensor data is injected at RESPLE's internal
+// per-lidar/IMU cloud buffers. Sensor callbacks are compiled (their addresses
+// are taken in RESPLE's constructor) but are not invoked; callback behavior
+// representable by the prepared format is applied at this boundary. RESPLE's
+// downstream PointData construction and estimator loop remain upstream code.
+// Publishers become hooks via the compat rclcpp::Publisher<T>::capture_slot()
+// mechanism (see compat/rclcpp/rclcpp.hpp) rather than by patching publish
+// call sites.
 //
 // processData() runs on its own worker thread, exactly as upstream's main()
-// starts it. finish_requested() (resple_bridge/offline_bridge.hpp, wired via
-// patches/integration/02-finish-condition.patch) is how the bridge stops
-// that thread deterministically instead of relying on process termination.
+// starts it. Its completion condition is state-based rather than timed: the
+// producer closes input, and the worker stops after the first pass that both
+// *began* with input closed and moved nothing (see offline_bridge.hpp).
 
 #include <resple_bridge/offline_bridge.hpp>
 
@@ -23,15 +24,16 @@
 #include <pybind11/stl.h>
 
 #include <atomic>
-#include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstring>
 #include <cstdint>
 #include <deque>
 #include <exception>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -49,19 +51,69 @@ namespace py = pybind11;
 namespace resple_bridge {
 
 namespace {
-std::atomic<bool>& finish_flag() {
+std::atomic<bool>& input_closed_flag() {
   static std::atomic<bool> flag{false};
   return flag;
 }
+// Monotonic counter bumped by every note_progress(). The backpressure wait
+// compares against a snapshot rather than a bare flag, so a notification that
+// lands between "read the snapshot" and "start waiting" cannot be missed.
+std::atomic<std::uint64_t>& progress_epoch() {
+  static std::atomic<std::uint64_t> value{0};
+  return value;
+}
+std::mutex& progress_mutex() {
+  static std::mutex value;
+  return value;
+}
+std::condition_variable& progress_condition() {
+  static std::condition_variable value;
+  return value;
+}
 }  // namespace
 
-bool finish_requested() noexcept { return finish_flag().load(std::memory_order_relaxed); }
+// --- offline_bridge.hpp surface ---------------------------------------------
+
+void reset_session_state() noexcept {
+  input_closed_flag().store(false, std::memory_order_release);
+  progress_epoch().store(0, std::memory_order_release);
+}
+
+bool input_closed() noexcept {
+  return input_closed_flag().load(std::memory_order_acquire);
+}
+
+void note_progress() noexcept {
+  progress_epoch().fetch_add(1, std::memory_order_release);
+  progress_condition().notify_all();
+}
+
+void close_input() noexcept {
+  input_closed_flag().store(true, std::memory_order_release);
+  note_progress();  // release a producer parked in await_progress()
+}
+
+// --- Producer-side wait (bindings.cpp only, never seen by upstream) ---------
+
+std::uint64_t current_progress_epoch() noexcept {
+  return progress_epoch().load(std::memory_order_acquire);
+}
+
+// Blocks until the epoch moves past `epoch`, i.e. until the worker has
+// actually dequeued something (or exited, or input was closed). Untimed on
+// purpose: the only state the caller waits on is a full sweep queue, and the
+// only thing that drains it is the worker loop, which notifies on every pop
+// and once more when it stops.
+std::uint64_t await_progress(std::uint64_t epoch) noexcept {
+  std::unique_lock<std::mutex> lock(progress_mutex());
+  progress_condition().wait(lock, [epoch] { return current_progress_epoch() != epoch; });
+  return current_progress_epoch();
+}
 
 }  // namespace resple_bridge
 
 namespace {
 
-using Clock = std::chrono::steady_clock;
 using FloatArray = py::array_t<float, py::array::c_style | py::array::forcecast>;
 using DoubleArray = py::array_t<double, py::array::c_style | py::array::forcecast>;
 
@@ -87,8 +139,13 @@ struct Recorder {
   std::vector<Event> events;
   std::int64_t imu_samples = 0;
   std::int64_t lidar_sweeps_pushed = 0;
-  std::int64_t poses_committed = 0;
   std::int64_t map_batches_emitted = 0;
+  // Data still buffered when the worker stopped. Non-zero is not necessarily a
+  // bug (upstream never processes a trailing partial measurement batch either)
+  // but it is the signal that would expose a silent tail drop, so it is
+  // reported rather than discarded. Filled once, after the worker is joined.
+  std::int64_t residual_sweeps = 0;
+  std::int64_t residual_points = 0;
 
   void reset() {
     std::lock_guard<std::mutex> lock(mutex);
@@ -97,8 +154,9 @@ struct Recorder {
     events.clear();
     imu_samples = 0;
     lidar_sweeps_pushed = 0;
-    poses_committed = 0;
     map_batches_emitted = 0;
+    residual_sweeps = 0;
+    residual_points = 0;
   }
 };
 
@@ -110,6 +168,35 @@ Recorder& recorder() {
 double ns_to_seconds(std::int64_t ns) { return static_cast<double>(ns) * 1e-9; }
 std::int64_t seconds_to_ns(double seconds) {
   return static_cast<std::int64_t>(std::llround(seconds * 1e9));
+}
+
+// RESPLE's initialization() derives the gravity direction (and hence the
+// initial orientation, and hence the whole trajectory) from the mean of
+// `std::min(15, imu_buff.size())` samples. Below 15 that count depends on how
+// far the producer thread happened to run before the worker reached init, so
+// the result is scheduler-dependent; at 15 or more the mean is over a fixed
+// prefix of a FIFO and is deterministic. Keep in sync with upstream
+// RESPLE.cpp's `int n_imu = std::min(15, buff_size);`.
+constexpr std::int64_t kInitGravitySamples = 15;
+
+// The window of a spline over which a sampled pose is meaningful.
+//
+// Both ends of [minTimeNs(), maxTimeNs()] are excluded:
+//   - minTimeNs() sits one knot interval *before* the first real knot while
+//     the spline still carries its leading idle knots, so poses there are
+//     backward extrapolation into the pre-initialization region.
+//   - the final interval is forward propagation only: collectMeasurements()
+//     will not form a batch until data exists beyond maxTimeNs() + dt_ns, so
+//     at end of input the last interval never receives a measurement update.
+//     This is also why upstream's own live publication trails the leading
+//     edge by one knot.
+// A cubic B-spline needs 4 control points before any of it is meaningful.
+bool spline_pose_window(const SplineState* spline, std::int64_t& first_ns,
+                        std::int64_t& last_ns) {
+  if (!spline || spline->numKnots() < 4) return false;
+  first_ns = std::max(spline->minTimeNs(), spline->getKnotTimeNs(0));
+  last_ns = spline->maxTimeNs() - spline->getKnotTimeIntervalNs();
+  return last_ns >= first_ns;
 }
 
 // ---------------------------------------------------------------------------
@@ -167,7 +254,7 @@ class RespleOdometry {
           "subprocess.");
 
     recorder().reset();
-    resple_bridge::finish_flag().store(false);
+    resple_bridge::reset_session_state();
     reset_publisher_captures();
 
     node_ = rclcpp::Node::make_shared("RESPLE");
@@ -179,21 +266,25 @@ class RespleOdometry {
       node_->set_parameter<std::string>("topic_imu", "/offline/imu");
 
     resple_ = std::make_unique<RESPLE>(node_);
+    if (resple_->point_filter_num < 1)
+      throw py::value_error("point_filter_num must be at least 1");
     install_captures();  // captures resple_.get(); must run after construction
     start_worker();
   }
 
   ~RespleOdometry() {
     try {
-      shutdown(1.0);
+      shutdown();
     } catch (...) {
-      // A destructor must not propagate; already surfaced via another call.
+      // A destructor must not propagate. Any worker failure has already been
+      // surfaced by finish()/push_*; all this can lose is a join() error.
     }
   }
 
   std::int64_t push_imu(double timestamp, const std::vector<double>& acceleration,
                         const std::vector<double>& angular_velocity) {
     throw_if_failed();
+    throw_if_input_closed();
     if (acceleration.size() != 3 || angular_velocity.size() != 3)
       throw py::value_error("acceleration and angular_velocity must have length 3");
     for (int axis = 0; axis < 3; ++axis)
@@ -219,52 +310,66 @@ class RespleOdometry {
       resple_->imu_int_buff.push_back(message);
     }
 
+    imu_pushed_ += 1;
     auto& state = recorder();
     std::lock_guard<std::mutex> lock(state.mutex);
-    state.imu_samples += 1;
+    state.imu_samples = imu_pushed_;
     return state.imu_samples;
   }
 
   std::int64_t push_lidar(double timestamp, const FloatArray& points,
-                          const DoubleArray& relative_times, double blind) {
+                          const DoubleArray& relative_times) {
     throw_if_failed();
+    throw_if_input_closed();
     validate_sweep(timestamp, points, relative_times);
+
+    const std::int64_t time_begin_ns =
+        seconds_to_ns(timestamp) - (lidar_type_ == "Ouster" ? resple_->time_offset : 0);
+    // Both IMU-coverage checks run before the (blocking) backpressure wait:
+    // neither depends on worker progress, so failing them early keeps a
+    // rejected sweep from parking the producer first.
+    require_imu_coverage(timestamp, time_begin_ns);
     apply_backpressure();
     throw_if_failed();
-
-    if (last_imu_stamp_ < timestamp + min_imu_lead_seconds_)
-      throw py::value_error(
-          "insufficient IMU lead for sweep at t=" + std::to_string(timestamp) +
-          ": have IMU through " + std::to_string(last_imu_stamp_) +
-          ", need through at least " +
-          std::to_string(timestamp + min_imu_lead_seconds_) +
-          " (min_imu_lead_seconds=" + std::to_string(min_imu_lead_seconds_) +
-          "). Push more IMU before this sweep.");
 
     auto p = points.unchecked<2>();
     auto t = relative_times.unchecked<1>();
     const py::ssize_t count = points.shape(0);
+    const float blind = resple_->lidars.at(lidar_type_).blind;
     const float blind2 = blind * blind;
+    // Upstream's per-frame `static int64_t last_t_ns = time_begin;` -- on the
+    // first frame the cross-frame filter below compares against that frame's
+    // own start, so a point at exactly offset 0 is dropped there too.
+    if (last_absolute_point_stamp_ns_ == std::numeric_limits<std::int64_t>::min())
+      last_absolute_point_stamp_ns_ = time_begin_ns;
 
-    // Exactly what RESPLE's sensor-specific callbacks do: build a raw
-    // pcl::PointXYZINormal cloud with intensity = relative time in ms
-    // (matching e.g. the Ouster path's `pt.intensity = t_ns / 1e6`), apply
-    // the same blind-range filter, and push (points, sweep-start-ns) onto
-    // the lidar's own buffer under its own mutex.
+    // The prepared dataset has already canonicalized sensor packets. At this
+    // boundary preserve XYZI, encode relative time in the internal intensity
+    // field, and apply the per-point filters ousterLidarCallback applies, in
+    // the same order and against the same reference values: raw-index
+    // thinning, blind range, and the strictly-increasing absolute-stamp test
+    // against the previous frame's last kept point.
     Eigen::aligned_vector<pcl::PointXYZINormal> cloud;
     cloud.reserve(static_cast<std::size_t>(count));
+    std::int64_t max_kept_offset_ns = 0;
     for (py::ssize_t i = 0; i < count; ++i) {
+      if (i % resple_->point_filter_num != 0) continue;
       const float x = p(i, 0), y = p(i, 1), z = p(i, 2);
       if (x * x + y * y + z * z <= blind2) continue;
+      const std::int64_t offset_ns = seconds_to_ns(t(i));
+      if (time_begin_ns + offset_ns <= last_absolute_point_stamp_ns_) continue;
       pcl::PointXYZINormal pt;
       pt.x = x; pt.y = y; pt.z = z;
       pt.intensity = static_cast<float>(t(i) * 1000.0);  // seconds -> ms
       pt.curvature = points.shape(1) == 4 ? p(i, 3) : 0.0f;
       cloud.push_back(pt);
+      if (offset_ns > max_kept_offset_ns) max_kept_offset_ns = offset_ns;
     }
-    if (cloud.empty()) throw py::value_error("sweep has no points after blind-range filtering");
+    if (cloud.empty())
+      throw py::value_error(
+          "sweep at t=" + std::to_string(timestamp) +
+          " has no points left after point_filter_num/blind-range/timestamp filtering");
 
-    const std::int64_t time_begin_ns = seconds_to_ns(timestamp);
     // lidars_data/lidars are keyed by lidar *type* upstream (see e.g.
     // RESPLE::ousterLidarCallback's `lidars.at("Ouster")`), not by the
     // "lidars" list's arbitrary config-prefix name.
@@ -276,18 +381,23 @@ class RespleOdometry {
     }
 
     last_lidar_stamp_ = timestamp;
+    last_absolute_point_stamp_ns_ = time_begin_ns + max_kept_offset_ns;
     auto& state = recorder();
     std::lock_guard<std::mutex> lock(state.mutex);
     state.lidar_sweeps_pushed += 1;
     return state.lidar_sweeps_pushed;
   }
 
-  py::dict finish(double timeout_seconds) {
+  py::dict finish() {
+    // No timeout parameter on purpose: completion is a state condition, and a
+    // wall-clock deadline could only truncate a still-progressing replay,
+    // which is exactly the nondeterminism this bridge exists to avoid.
     {
       py::gil_scoped_release release;
-      shutdown(timeout_seconds);
+      shutdown();
     }
     throw_if_failed();
+    sample_finalized_trajectory();
     py::dict result;
     result["trajectory"] = trajectory_array();
     result["map_batches"] = drain_map_batches();
@@ -327,8 +437,13 @@ class RespleOdometry {
     py::dict result;
     result["imu_samples"] = state.imu_samples;
     result["lidar_sweeps_pushed"] = state.lidar_sweeps_pushed;
-    result["poses_committed"] = state.poses_committed;
+    // Rows in the trajectory buffer: live knot samples before finish(),
+    // finalized-spline samples after it. status() reports the live count under
+    // its own name so the two are never confused.
+    result["poses_committed"] = static_cast<std::int64_t>(state.trajectory.size());
     result["map_batches_emitted"] = state.map_batches_emitted;
+    result["residual_sweeps"] = state.residual_sweeps;
+    result["residual_points"] = state.residual_points;
     result["estimator_threads"] = NUM_OF_THREAD;
     return result;
   }
@@ -351,7 +466,7 @@ class RespleOdometry {
     auto& state = recorder();
     std::lock_guard<std::mutex> lock(state.mutex);
     py::dict result;
-    result["poses_committed"] = state.poses_committed;
+    result["live_poses_sampled"] = static_cast<std::int64_t>(state.trajectory.size());
     result["lidar_sweeps_pushed"] = state.lidar_sweeps_pushed;
     result["worker_finished"] = worker_finished_.load();
     result["last_imu_stamp"] = last_imu_stamp_;
@@ -404,19 +519,15 @@ class RespleOdometry {
           state.events.push_back(Event{"init", ns_to_seconds(msg.data)});
         };
 
-    // Fires whenever the spline gains a new knot (~every 1/knot_hz seconds
-    // of estimated trajectory). Sample the pose one knot interval behind the
-    // leading edge, where the spline is well-constrained rather than freshly
-    // extrapolated -- the same interior-of-the-window assumption
-    // RESPLE::getPositionLiDAR relies on elsewhere.
-    RESPLE* resple_ptr = resple_.get();  // captured by pointer; alive for session lifetime
+    // Live samples are useful before finish(). finish() replaces this vector
+    // by sampling the fully drained, finalized spline.
+    RESPLE* resple_ptr = resple_.get();
     rclcpp::Publisher<estimate_msgs::msg::Estimate>::capture_slot() =
         [resple_ptr](const estimate_msgs::msg::Estimate&) {
-          if (!resple_ptr || !resple_ptr->spline) return;
+          if (!resple_ptr) return;
           SplineState* spline = resple_ptr->spline;
-          if (spline->numKnots() < 4) return;
-          const std::int64_t t_ns = spline->maxTimeNs() - spline->getKnotTimeIntervalNs();
-          if (t_ns < spline->minTimeNs()) return;
+          std::int64_t first_ns = 0, t_ns = 0;
+          if (!spline_pose_window(spline, first_ns, t_ns)) return;
           Eigen::Vector3d pos = spline->itpPosition(t_ns);
           Eigen::Quaterniond q;
           spline->itpQuaternion(t_ns, &q);
@@ -426,7 +537,6 @@ class RespleOdometry {
             return;
           state.trajectory.push_back(PoseRecord{ns_to_seconds(t_ns), pos.x(), pos.y(), pos.z(),
                                                 q.x(), q.y(), q.z(), q.w()});
-          state.poses_committed += 1;
         };
 
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::capture_slot() =
@@ -451,44 +561,36 @@ class RespleOdometry {
         std::lock_guard<std::mutex> lock(worker_mutex_);
         if (!worker_error_) worker_error_ = std::current_exception();
       }
-      worker_finished_.store(true);
-      worker_progress_.notify_all();
+      worker_finished_.store(true, std::memory_order_release);
+      // Unblocks a producer parked in apply_backpressure() on a worker that
+      // has stopped; it rechecks worker_finished_ and raises.
+      resple_bridge::note_progress();
     });
   }
 
-  void shutdown(double timeout_seconds) {
+  void shutdown() {
     if (!worker_.joinable()) return;
-    const auto deadline = Clock::now() + std::chrono::duration<double>(
-        timeout_seconds > 0 ? timeout_seconds : 0.0);
-
-    // processData()'s outer loop only checks finish_requested() between full
-    // drain passes. Setting the flag while pushed sweeps are still queued
-    // would let the worker stop mid-drain and silently discard them
-    // (ARCHITECTURE.md: "internal resets do not silently discard earlier
-    // usable output"). Wait for the mutex-protected raw per-lidar queue to
-    // empty out, then a fixed grace period for processData's own (internal,
-    // single-threaded, unsynchronized) pt_buff/collectMeasurements draining
-    // of what it already popped -- pt_buff has no mutex of its own to poll
-    // safely from this thread. Not watertight under extreme load; see
-    // UPSTREAM.md limitations.
-    while (Clock::now() < deadline && !worker_finished_.load()) {
-      RESPLE::LidarData& buffers = resple_->lidars_data.at(lidar_type_);
-      bool drained;
-      {
-        std::lock_guard<std::mutex> lock(buffers.mtx_pc);
-        drained = buffers.t_buff.empty();
-      }
-      if (drained) break;
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-    resple_bridge::finish_flag().store(true);
-    while (Clock::now() < deadline && !worker_finished_.load())
-      std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    if (!worker_finished_.load())
-      throw std::runtime_error("timed out waiting for RESPLE's processData() thread to stop");
+    resple_bridge::close_input();
+    // join() is the state wait: processData returns only after a pass that
+    // began with input closed and made no progress. Keep ownership until
+    // then; this worker captures `this` and must never be detached.
     worker_.join();
+    record_residual_buffers();
+  }
+
+  // Only safe once the worker is joined: pt_buff is worker-owned and has no
+  // mutex of its own.
+  void record_residual_buffers() {
+    std::int64_t sweeps = 0, points = 0;
+    for (const auto& [name, buffers] : resple_->lidars_data) {
+      (void)name;
+      sweeps += static_cast<std::int64_t>(buffers.t_buff.size());
+      points += static_cast<std::int64_t>(buffers.pt_buff.size());
+    }
+    auto& state = recorder();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.residual_sweeps = sweeps;
+    state.residual_points = points;
   }
 
   void throw_if_failed() {
@@ -496,35 +598,56 @@ class RespleOdometry {
     if (worker_error_) std::rethrow_exception(worker_error_);
   }
 
+  void throw_if_input_closed() const {
+    if (resple_bridge::input_closed())
+      throw std::runtime_error("RESPLE input is closed; no more sensor data may be pushed");
+  }
+
+  // Bounds the raw sweep queue. Note this bounds pc_buff only: processData
+  // drains all of pc_buff into pt_buff on every pass, so pt_buff -- the far
+  // heavier buffer -- is what actually grows when the producer outruns the
+  // estimator. metrics()["residual_points"] reports its depth at exit.
   void apply_backpressure() {
-    // 60s was too tight for real (not synthetic) datasets where processData()
-    // is legitimately busy -- not stuck -- but slower than max_pending_sweeps_
-    // worth of headroom, e.g. degenerate feature association / heavier
-    // ikd-tree rebuild activity on noisy/sparse point returns. Confirmed on
-    // miniprism_JHU_..._uasnoisy: CPU stayed pegged at ~230-300% (multiple
-    // native threads busy) for the full run, yet the queue never drained
-    // below max_pending_sweeps_ within 60s at some point mid-stream. Widened
-    // to match the same order of magnitude as PROCESSING_TIMEOUT_SECONDS in
-    // scripts/run_resple.py (the analogous tail-flush budget, also raised
-    // for the same reason on nglamp_SRNL_..._deepforest).
-    const auto deadline = Clock::now() + std::chrono::seconds(600);
-    while (Clock::now() < deadline) {
-      // lidars_data/lidars are keyed by lidar *type* upstream (see e.g.
-    // RESPLE::ousterLidarCallback's `lidars.at("Ouster")`), not by the
-    // "lidars" list's arbitrary config-prefix name.
     RESPLE::LidarData& buffers = resple_->lidars_data.at(lidar_type_);
+    // Snapshot the epoch *before* reading the queue depth: a dequeue landing
+    // between the two only makes the wait return immediately.
+    std::uint64_t epoch = resple_bridge::current_progress_epoch();
+    while (true) {
       std::size_t pending;
       {
         std::lock_guard<std::mutex> lock(buffers.mtx_pc);
         pending = buffers.t_buff.size();
       }
       if (static_cast<int>(pending) < max_pending_sweeps_) return;
-      if (worker_finished_.load()) return;
       throw_if_failed();
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      if (worker_finished_.load(std::memory_order_acquire))
+        throw std::runtime_error("RESPLE worker stopped while applying lidar backpressure");
+      epoch = resple_bridge::await_progress(epoch);
     }
-    throw std::runtime_error(
-        "timed out applying lidar backpressure: processData() is not draining its queue");
+  }
+
+  // The two IMU-coverage preconditions, both producer-side and both checked
+  // before any blocking wait.
+  void require_imu_coverage(double timestamp, std::int64_t time_begin_ns) const {
+    // "insufficient IMU lead" is load-bearing: scripts/run_resple.py matches on
+    // it to tell a leading-edge IMU gap (skip this sweep) from a real error.
+    if (last_lidar_stamp_ == -std::numeric_limits<double>::infinity() &&
+        imu_pushed_ < kInitGravitySamples)
+      throw py::value_error(
+          "insufficient IMU lead for the first sweep at t=" + std::to_string(timestamp) +
+          ": RESPLE averages the first " + std::to_string(kInitGravitySamples) +
+          " IMU samples to derive gravity, so at least that many must precede the "
+          "first accepted sweep for the result to be reproducible (have " +
+          std::to_string(imu_pushed_) + ").");
+    const double adjusted_timestamp = ns_to_seconds(time_begin_ns);
+    if (last_imu_stamp_ < adjusted_timestamp + min_imu_lead_seconds_)
+      throw py::value_error(
+          "insufficient IMU lead for sweep at t=" + std::to_string(timestamp) +
+          ": have IMU through " + std::to_string(last_imu_stamp_) +
+          ", need through at least " +
+          std::to_string(adjusted_timestamp + min_imu_lead_seconds_) +
+          " (min_imu_lead_seconds=" + std::to_string(min_imu_lead_seconds_) +
+          "). Push more IMU before this sweep.");
   }
 
   void validate_sweep(double timestamp, const FloatArray& points,
@@ -551,6 +674,27 @@ class RespleOdometry {
     }
   }
 
+  // Replaces the live samples with a uniform resampling of the finalized
+  // spline, once the worker has drained and joined. Publication timing is not
+  // authoritative for a spline estimator -- knots keep being refined after the
+  // control point that produced them was published.
+  void sample_finalized_trajectory() {
+    auto& state = recorder();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.trajectory.clear();
+    SplineState* spline = resple_->spline;
+    std::int64_t first_ns = 0, last_ns = 0;
+    if (!spline_pose_window(spline, first_ns, last_ns)) return;
+    const std::int64_t dt_ns = spline->getKnotTimeIntervalNs();
+    for (std::int64_t t_ns = first_ns; t_ns <= last_ns; t_ns += dt_ns) {
+      Eigen::Vector3d pos = spline->itpPosition(t_ns);
+      Eigen::Quaterniond q;
+      spline->itpQuaternion(t_ns, &q);
+      state.trajectory.push_back(PoseRecord{ns_to_seconds(t_ns), pos.x(), pos.y(), pos.z(),
+                                            q.x(), q.y(), q.z(), q.w()});
+    }
+  }
+
   py::array_t<double> trajectory_array() {
     auto& state = recorder();
     std::lock_guard<std::mutex> lock(state.mutex);
@@ -574,10 +718,11 @@ class RespleOdometry {
   std::thread worker_;
   std::atomic<bool> worker_finished_{false};
   std::mutex worker_mutex_;
-  std::condition_variable worker_progress_;
   std::exception_ptr worker_error_;
+  std::int64_t imu_pushed_ = 0;
   double last_imu_stamp_ = -std::numeric_limits<double>::infinity();
   double last_lidar_stamp_ = -std::numeric_limits<double>::infinity();
+  std::int64_t last_absolute_point_stamp_ns_ = std::numeric_limits<std::int64_t>::min();
 };
 
 }  // namespace
@@ -596,10 +741,10 @@ PYBIND11_MODULE(_core, module) {
       .def("push_imu", &RespleOdometry::push_imu, py::arg("timestamp"),
            py::arg("acceleration"), py::arg("angular_velocity"))
       .def("push_lidar", &RespleOdometry::push_lidar, py::arg("timestamp"), py::arg("points"),
-           py::arg("relative_times"), py::arg("blind"))
+           py::arg("relative_times"))
       .def("trajectory", &RespleOdometry::trajectory)
       .def("drain_map_batches", &RespleOdometry::drain_map_batches)
-      .def("finish", &RespleOdometry::finish, py::arg("timeout_seconds") = 60.0)
+      .def("finish", &RespleOdometry::finish)
       .def("metrics", &RespleOdometry::metrics)
       .def("events", &RespleOdometry::events)
       .def("status", &RespleOdometry::status);

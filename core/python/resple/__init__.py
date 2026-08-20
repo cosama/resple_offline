@@ -45,11 +45,17 @@ class RespleOdometry:
 
     def push_lidar(self, timestamp: float, points: np.ndarray, relative_times: np.ndarray) -> int:
         """`points` is (N, 3) or (N, 4) [x, y, z, (intensity)]; `relative_times`
-        is (N,) seconds since `timestamp`, non-negative and non-decreasing."""
+        is canonical/preprocessed (N,) seconds since `timestamp`, non-negative
+        and non-decreasing. Injection begins at RESPLE's internal cloud buffer.
+
+        Raises ValueError mentioning "insufficient IMU lead" when the IMU
+        pushed so far does not cover this sweep -- including for the first
+        sweep, which additionally needs enough samples for RESPLE's gravity
+        initialization to be reproducible.
+        """
         points = np.ascontiguousarray(points, dtype=np.float32)
         relative_times = np.ascontiguousarray(relative_times, dtype=np.float64)
-        blind = self._cfg.lidars[0].blind
-        return self._native.push_lidar(float(timestamp), points, relative_times, blind)
+        return self._native.push_lidar(float(timestamp), points, relative_times)
 
     def trajectory(self) -> np.ndarray:
         """(N, 8): timestamp, x, y, z, qx, qy, qz, qw."""
@@ -67,8 +73,13 @@ class RespleOdometry:
     def status(self) -> dict:
         return self._native.status()
 
-    def finish(self, timeout_seconds: float = 60.0) -> dict:
-        return self._native.finish(timeout_seconds)
+    def finish(self) -> dict:
+        """Close input, drain the worker, and return the finalized results.
+
+        There is no timeout: completion is a state condition, so a deadline
+        could only truncate a still-progressing replay.
+        """
+        return self._native.finish()
 
     def __enter__(self) -> "RespleOdometry":
         return self

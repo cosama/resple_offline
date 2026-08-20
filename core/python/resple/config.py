@@ -90,6 +90,8 @@ class RespleConfig:
             problems.append("knot_hz must be positive")
         if self.num_points_upd <= 0:
             problems.append("num_points_upd must be positive")
+        if self.point_filter_num <= 0:
+            problems.append("point_filter_num must be positive")
         if len(self.cov_acc) != 3 or len(self.cov_gyro) != 3:
             problems.append("cov_acc and cov_gyro must have length 3")
         if len(self.cov_ba) != 3 or len(self.cov_bg) != 3:

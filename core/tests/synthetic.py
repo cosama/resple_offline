@@ -37,18 +37,25 @@ def box_room_sweep(position: np.ndarray, n_azimuth: int = 360, n_rings: int = 16
     return points, relative_times
 
 
+# RESPLE's gravity initialization averages its first 15 IMU samples, so the
+# first sweep must be preceded by at least that many for the run to be
+# reproducible (bindings.cpp: kInitGravitySamples). 0.1 s at 200 Hz is 21.
+IMU_LEAD_SECONDS = 0.1
+
+
 def run_stationary_session(odom, duration: float = 3.0, imu_hz: float = 200.0,
                            lidar_hz: float = 10.0) -> dict:
     """Feed a stationary box-room scene through `odom` (a resple.RespleOdometry) and finish()."""
+    assert imu_hz * IMU_LEAD_SECONDS >= 15, "first sweep would race gravity initialization"
     next_lidar_t = 0.0
     sweep_index = 0
     n_imu = int(duration * imu_hz) + 50
     for i in range(n_imu):
         stamp = i / imu_hz
         odom.push_imu(stamp, [0.0, 0.0, GRAVITY], [0.0, 0.0, 0.0])
-        while next_lidar_t <= stamp - 0.05 and next_lidar_t < duration:
+        while next_lidar_t <= stamp - IMU_LEAD_SECONDS and next_lidar_t < duration:
             points, relative_times = box_room_sweep(np.zeros(3), seed=sweep_index)
             odom.push_lidar(next_lidar_t, points, relative_times)
             sweep_index += 1
             next_lidar_t += 1.0 / lidar_hz
-    return odom.finish(30.0)
+    return odom.finish()

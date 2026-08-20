@@ -20,6 +20,7 @@ CORE_DIR = Path(__file__).resolve().parents[1]
 pytest.importorskip("resple._core", reason="build _core first (uv sync)")
 
 _SESSION_SCRIPT = textwrap.dedent("""
+    import hashlib
     import numpy as np
     from resple import RespleOdometry, config as cfgmod
     from tests.synthetic import run_stationary_session
@@ -32,11 +33,14 @@ _SESSION_SCRIPT = textwrap.dedent("""
     })
     odom = RespleOdometry(cfg)
     result = run_stationary_session(odom)
-    traj = result["trajectory"]
+    traj = np.ascontiguousarray(result["trajectory"], dtype=np.float64)
+    metrics = result["metrics"]
     print("POSES", traj.shape[0])
     print("FINITE", bool(np.isfinite(traj).all()))
-    if traj.shape[0]:
-        print("LAST", " ".join(f"{v:.9f}" for v in traj[-1]))
+    print("RESIDUAL", metrics["residual_sweeps"], metrics["residual_points"])
+    # Bit-exact over the whole trajectory, not just its last row: a scheduling
+    # difference early in the run can be re-absorbed by later knots.
+    print("TRAJ", hashlib.sha256(traj.tobytes()).hexdigest())
 """)
 
 
@@ -56,6 +60,13 @@ def test_stationary_session_commits_finite_poses():
     assert lines["FINITE"] == "True"
 
 
+def test_stationary_session_drains_every_pushed_sweep():
+    """A residual sweep would mean the worker stopped with input still queued."""
+    lines = dict(line.split(" ", 1) for line in _run_session().splitlines() if " " in line)
+    residual_sweeps, _residual_points = lines["RESIDUAL"].split()
+    assert residual_sweeps == "0", "worker stopped with sweeps still buffered"
+
+
 def test_stationary_session_is_deterministic():
-    first, second = _run_session(), _run_session()
-    assert first == second, "identical synthetic input produced different output"
+    runs = [_run_session() for _ in range(3)]
+    assert len(set(runs)) == 1, "identical synthetic input produced different output"
