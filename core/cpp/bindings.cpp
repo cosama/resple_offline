@@ -2,7 +2,7 @@
 //
 // Design: RESPLE.cpp (staged + patched, see patches/integration/) is
 // #included directly below, giving this translation unit access to the
-// RESPLE class with its buffers made public (01-bridge-visibility.patch).
+// RESPLE class with its buffers made public (01-resple-node.patch).
 // Canonical/preprocessed sensor data is injected at RESPLE's internal
 // per-lidar/IMU cloud buffers. Sensor callbacks are compiled (their addresses
 // are taken in RESPLE's constructor) but are not invoked; callback behavior
@@ -23,6 +23,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -209,24 +210,78 @@ bool spline_pose_window(const SplineState* spline, std::int64_t& first_ns,
 // (CommonUtils::readParam<T> is type-strict: std::any_cast<T> fails silently
 // to "not present" for a mismatched type, e.g. double where float is read).
 // A generic py::dict type-sniffing loop would risk exactly that mismatch, so
-// this bridge takes explicit typed arguments instead (ARCHITECTURE.md #7:
-// plumb every behavior-affecting option deliberately).
+// every key is named and cast to a fixed type here (ARCHITECTURE.md #7: plumb
+// every behavior-affecting option deliberately).
 // ---------------------------------------------------------------------------
-void configure_lidar(rclcpp::Node::SharedPtr& node, const std::string& name,
-                     const std::string& topic_lidar, const std::string& lidar_type,
-                     int scan_line, float blind,
-                     const std::vector<double>& q_lb, const std::vector<double>& t_lb,
-                     double w_pt) {
-  const std::string prefix = name + ".";
-  node->set_parameter<std::string>(
-      prefix + "topic_lidar", topic_lidar.empty() ? "/offline/" + name : topic_lidar);
-  node->set_parameter<std::string>(prefix + "lidar_type", lidar_type);
-  node->set_parameter<int>(prefix + "scan_line", scan_line);
-  node->set_parameter<float>(prefix + "blind", blind);
-  node->set_parameter<std::vector<double>>(prefix + "q_lb", q_lb);
-  node->set_parameter<std::vector<double>>(prefix + "t_lb", t_lb);
-  node->set_parameter<double>(prefix + "w_pt", w_pt);
+
+// One configured LiDAR as the Python layer hands it over: a mapping with
+// exactly the fields of upstream's per-lidar YAML block, plus the name it is
+// listed under in `lidars`. It arrives as a dict because `lidars` is a list
+// and upstream's own YAML nests it the same way; each field is still cast to
+// one fixed type, and py::cast raises on a mismatch rather than silently
+// producing a parameter readParam<T> will not see.
+struct LidarSpec {
+  std::string name;
+  std::string topic_lidar;
+  std::string lidar_type;
+  int scan_line = 1;
+  float blind = 0.0f;
+  std::vector<double> q_lb;
+  std::vector<double> t_lb;
+  double w_pt = 0.01;
+};
+
+LidarSpec parse_lidar_spec(const py::dict& entry) {
+  auto field = [&entry](const char* key) -> py::handle {
+    if (!entry.contains(key))
+      throw py::value_error(std::string("lidar entry is missing '") + key + "'");
+    return entry[key];
+  };
+  LidarSpec spec;
+  spec.name = py::cast<std::string>(field("name"));
+  spec.lidar_type = py::cast<std::string>(field("lidar_type"));
+  spec.topic_lidar = py::cast<std::string>(field("topic_lidar"));
+  spec.scan_line = py::cast<int>(field("scan_line"));
+  spec.blind = py::cast<float>(field("blind"));
+  spec.q_lb = py::cast<std::vector<double>>(field("q_lb"));
+  spec.t_lb = py::cast<std::vector<double>>(field("t_lb"));
+  spec.w_pt = py::cast<double>(field("w_pt"));
+  if (spec.name.empty()) throw py::value_error("lidar name must not be empty");
+  if (spec.q_lb.size() != 4)
+    throw py::value_error("lidar '" + spec.name + "': q_lb must have length 4 (w, x, y, z)");
+  if (spec.t_lb.size() != 3)
+    throw py::value_error("lidar '" + spec.name + "': t_lb must have length 3");
+  return spec;
 }
+
+void configure_lidar(rclcpp::Node::SharedPtr& node, const LidarSpec& spec) {
+  const std::string prefix = spec.name + ".";
+  node->set_parameter<std::string>(
+      prefix + "topic_lidar",
+      spec.topic_lidar.empty() ? "/offline/" + spec.name : spec.topic_lidar);
+  node->set_parameter<std::string>(prefix + "lidar_type", spec.lidar_type);
+  node->set_parameter<int>(prefix + "scan_line", spec.scan_line);
+  node->set_parameter<float>(prefix + "blind", spec.blind);
+  node->set_parameter<std::vector<double>>(prefix + "q_lb", spec.q_lb);
+  node->set_parameter<std::vector<double>>(prefix + "t_lb", spec.t_lb);
+  node->set_parameter<double>(prefix + "w_pt", spec.w_pt);
+}
+
+// Producer-side state for one configured LiDAR.
+//
+// Upstream keys both `lidars` and `lidars_data` by lidar *type*, and each raw
+// sensor callback carries its own function-local `static int64_t last_t_ns`
+// (one callback per type). So per-type is exactly upstream's own granularity
+// for the cross-frame timestamp filter and the sweep buffers reproduced in
+// push_lidar -- which is also why two profiles of the same type are refused.
+struct LidarStream {
+  std::string type;
+  int scan_line = 1;
+  double last_stamp = -std::numeric_limits<double>::infinity();
+  std::int64_t last_absolute_point_stamp_ns = std::numeric_limits<std::int64_t>::min();
+  std::int64_t sweeps_pushed = 0;
+  std::int64_t points_after_preprocessing = 0;
+};
 
 // ---------------------------------------------------------------------------
 // Session
@@ -234,16 +289,11 @@ void configure_lidar(rclcpp::Node::SharedPtr& node, const std::string& name,
 
 class RespleOdometry {
  public:
-  RespleOdometry(const py::dict& params, const std::string& lidar_name,
-                std::string lidar_type, int scan_line, float blind,
-                const std::string& topic_lidar,
-                const std::vector<double>& q_lb, const std::vector<double>& t_lb,
-                double w_pt, int max_pending_sweeps, double min_imu_lead_seconds)
-      : lidar_name_(lidar_name),
-        lidar_type_(lidar_type),
-        scan_line_(scan_line),
-        max_pending_sweeps_(max_pending_sweeps),
+  RespleOdometry(const py::dict& params, const std::vector<py::dict>& lidars,
+                int max_pending_sweeps, double min_imu_lead_seconds)
+      : max_pending_sweeps_(max_pending_sweeps),
         min_imu_lead_seconds_(min_imu_lead_seconds) {
+    if (lidars.empty()) throw py::value_error("at least one lidar is required");
     if (max_pending_sweeps_ < 1)
       throw py::value_error("max_pending_sweeps must be at least 1");
     if (min_imu_lead_seconds_ < 0.0)
@@ -266,9 +316,23 @@ class RespleOdometry {
 
     node_ = rclcpp::Node::make_shared("RESPLE");
     apply_parameters(params);
-    configure_lidar(node_, lidar_name_, topic_lidar, lidar_type, scan_line, blind,
-                    q_lb, t_lb, w_pt);
-    node_->set_parameter<std::vector<std::string>>("lidars", {lidar_name_});
+    std::vector<std::string> lidar_names;
+    for (const py::dict& entry : lidars) {
+      const LidarSpec spec = parse_lidar_spec(entry);
+      for (const auto& [existing_name, existing] : streams_)
+        if (existing.type == spec.lidar_type)
+          throw py::value_error(
+              "lidars '" + existing_name + "' and '" + spec.name + "' both declare "
+              "lidar_type '" + spec.lidar_type + "': upstream RESPLE keys its "
+              "per-lidar configuration and buffers by type (lidars.emplace(lidar.type, "
+              "lidar)), so the second would be dropped and its sweeps fused into the "
+              "first one's stream.");
+      if (!streams_.emplace(spec.name, LidarStream{spec.lidar_type, spec.scan_line}).second)
+        throw py::value_error("duplicate lidar name '" + spec.name + "'");
+      configure_lidar(node_, spec);
+      lidar_names.push_back(spec.name);
+    }
+    node_->set_parameter<std::vector<std::string>>("lidars", lidar_names);
     if (!node_->was_provided("if_lidar_only"))
       node_->set_parameter<bool>("if_lidar_only", false);
     if (!node_->was_provided("topic_imu"))
@@ -338,18 +402,20 @@ class RespleOdometry {
   std::int64_t push_lidar(double timestamp, const FloatArray& points,
                           const DoubleArray& relative_times,
                           const py::object& lines_object = py::none(),
-                          const py::object& tags_object = py::none()) {
+                          const py::object& tags_object = py::none(),
+                          const std::string& lidar = std::string()) {
     throw_if_failed();
     throw_if_input_closed();
-    validate_sweep(timestamp, points, relative_times, lines_object, tags_object);
+    LidarStream& stream = select_stream(lidar);
+    validate_sweep(stream, timestamp, points, relative_times, lines_object, tags_object);
 
     const std::int64_t time_begin_ns =
-        seconds_to_ns(timestamp) - (lidar_type_ == "Ouster" ? resple_->time_offset : 0);
+        seconds_to_ns(timestamp) - (stream.type == "Ouster" ? resple_->time_offset : 0);
     // Both IMU-coverage checks run before the (blocking) backpressure wait:
     // neither depends on worker progress, so failing them early keeps a
     // rejected sweep from parking the producer first.
     require_imu_coverage(timestamp, time_begin_ns);
-    apply_backpressure();
+    apply_backpressure(stream);
     throw_if_failed();
 
     auto p = points.unchecked<2>();
@@ -361,13 +427,14 @@ class RespleOdometry {
     if (has_lines) lines = py::cast<IntArray>(lines_object);
     if (has_tags) tags = py::cast<IntArray>(tags_object);
     const py::ssize_t count = points.shape(0);
-    const float blind = resple_->lidars.at(lidar_type_).blind;
+    const float blind = resple_->lidars.at(stream.type).blind;
     const float blind2 = blind * blind;
     // Upstream's per-frame `static int64_t last_t_ns = time_begin;` -- on the
     // first frame the cross-frame filter below compares against that frame's
-    // own start, so a point at exactly offset 0 is dropped there too.
-    if (last_absolute_point_stamp_ns_ == std::numeric_limits<std::int64_t>::min())
-      last_absolute_point_stamp_ns_ = time_begin_ns;
+    // own start, so a point at exactly offset 0 is dropped there too. The
+    // static lives in the per-type callback, hence per-stream here.
+    if (stream.last_absolute_point_stamp_ns == std::numeric_limits<std::int64_t>::min())
+      stream.last_absolute_point_stamp_ns = time_begin_ns;
 
     // Reproduce the configured upstream callback at the internal-buffer
     // boundary. Canonical inputs may omit Livox line/tag after driver-level
@@ -376,9 +443,9 @@ class RespleOdometry {
     Eigen::aligned_vector<pcl::PointXYZINormal> cloud;
     cloud.reserve(static_cast<std::size_t>(count));
     std::int64_t max_kept_offset_ns = 0;
-    const bool livox_custom = lidar_type_ == "Mid70Avia" || lidar_type_ == "HAP360" ||
-                              lidar_type_ == "AviaResple";
-    const bool avia_resple = lidar_type_ == "AviaResple";
+    const bool livox_custom = stream.type == "Mid70Avia" || stream.type == "HAP360" ||
+                              stream.type == "AviaResple";
+    const bool avia_resple = stream.type == "AviaResple";
     int valid_point_num = 0;
     float previous_x = count ? p(0, 0) : 0.0f;
     float previous_y = count ? p(0, 1) : 0.0f;
@@ -392,12 +459,12 @@ class RespleOdometry {
       if (livox_custom) {
         const int line = has_lines ? lines.data()[i] : 0;
         const int tag = has_tags ? tags.data()[i] : 0;
-        const bool driver_valid = line < scan_line_ &&
+        const bool driver_valid = line < stream.scan_line &&
             (((tag & 0x30) == 0x10) || ((tag & 0x30) == 0x00));
         if (!driver_valid) continue;
         // AviaResple places the cross-frame timestamp predicate before the
         // valid-point counter; Mid70Avia/HAP360 place it in the final gate.
-        if (avia_resple && time_begin_ns + raw_offset_ns <= last_absolute_point_stamp_ns_)
+        if (avia_resple && time_begin_ns + raw_offset_ns <= stream.last_absolute_point_stamp_ns)
           continue;
         ++valid_point_num;
         if (valid_point_num % resple_->point_filter_num != 0) continue;
@@ -410,10 +477,10 @@ class RespleOdometry {
                              std::abs(y - previous_y) <= 1e-7f &&
                              std::abs(z - previous_z) <= 1e-7f;
       const std::int64_t callback_offset_ns =
-          (lidar_type_ == "Hesai" || lidar_type_ == "Mid360Boxi")
+          (stream.type == "Hesai" || stream.type == "Mid360Boxi")
               ? float_ms_offset_ns : raw_offset_ns;
       const bool time_valid = avia_resple ||
-          time_begin_ns + callback_offset_ns > last_absolute_point_stamp_ns_;
+          time_begin_ns + callback_offset_ns > stream.last_absolute_point_stamp_ns;
       const bool keep = offset_ms >= 0.0f && !duplicate &&
                         x * x + y * y + z * z > blind2 && time_valid;
       if (livox_custom) {
@@ -436,15 +503,20 @@ class RespleOdometry {
     // RESPLE::ousterLidarCallback's `lidars.at("Ouster")`), not by the
     // "lidars" list's arbitrary config-prefix name.
     const std::int64_t kept_points = static_cast<std::int64_t>(cloud.size());
-    RESPLE::LidarData& buffers = resple_->lidars_data.at(lidar_type_);
+    RESPLE::LidarData& buffers = resple_->lidars_data.at(stream.type);
     {
       std::lock_guard<std::mutex> lock(buffers.mtx_pc);
       buffers.pc_buff.push_back(std::move(cloud));
       buffers.t_buff.push_back(time_begin_ns);
     }
 
-    last_lidar_stamp_ = timestamp;
-    last_absolute_point_stamp_ns_ = time_begin_ns + max_kept_offset_ns;
+    stream.last_stamp = timestamp;
+    stream.last_absolute_point_stamp_ns = time_begin_ns + max_kept_offset_ns;
+    stream.sweeps_pushed += 1;
+    stream.points_after_preprocessing += kept_points;
+    // Global across lidars: this is what require_imu_coverage tests for "no
+    // sweep accepted yet", and initialization() runs once for the whole rig.
+    last_lidar_stamp_ = std::max(last_lidar_stamp_, timestamp);
     auto& state = recorder();
     std::lock_guard<std::mutex> lock(state.mutex);
     state.lidar_sweeps_pushed += 1;
@@ -510,6 +582,7 @@ class RespleOdometry {
     result["residual_sweeps"] = state.residual_sweeps;
     result["residual_points"] = state.residual_points;
     result["estimator_threads"] = NUM_OF_THREAD;
+    result["per_lidar"] = per_lidar();
     return result;
   }
 
@@ -537,10 +610,54 @@ class RespleOdometry {
     result["worker_finished"] = worker_finished_.load();
     result["last_imu_stamp"] = last_imu_stamp_;
     result["last_lidar_stamp"] = last_lidar_stamp_;
+    result["per_lidar"] = per_lidar();
     return result;
   }
 
  private:
+  // Producer-side counters, so a rig whose second lidar is silently never fed
+  // (which stalls upstream's collectMeasurements: it requires every lidar's
+  // pt_buff to be non-empty) is visible rather than merely slow.
+  py::dict per_lidar() const {
+    py::dict result;
+    for (const auto& [name, stream] : streams_) {
+      py::dict entry;
+      entry["lidar_type"] = stream.type;
+      entry["sweeps_pushed"] = stream.sweeps_pushed;
+      entry["points_after_preprocessing"] = stream.points_after_preprocessing;
+      entry["last_stamp"] = stream.last_stamp;
+      result[py::str(name)] = std::move(entry);
+    }
+    return result;
+  }
+
+  // Resolves push_lidar's `lidar=` argument. An empty name is the
+  // single-lidar shorthand; with a rig it is ambiguous rather than defaulted,
+  // because silently feeding one lidar of several is what stalls the worker.
+  LidarStream& select_stream(const std::string& name) {
+    if (name.empty()) {
+      if (streams_.size() != 1)
+        throw py::value_error(
+            "this session has " + std::to_string(streams_.size()) +
+            " lidars (" + lidar_names() + "); push_lidar needs an explicit lidar= name");
+      return streams_.begin()->second;
+    }
+    auto found = streams_.find(name);
+    if (found == streams_.end())
+      throw py::value_error("unknown lidar '" + name + "'; configured: " + lidar_names());
+    return found->second;
+  }
+
+  std::string lidar_names() const {
+    std::string result;
+    for (const auto& [name, stream] : streams_) {
+      (void)stream;
+      if (!result.empty()) result += ", ";
+      result += "'" + name + "'";
+    }
+    return result;
+  }
+
   static std::atomic<bool>& consumed() {
     static std::atomic<bool> value{false};
     return value;
@@ -673,8 +790,8 @@ class RespleOdometry {
   // drains all of pc_buff into pt_buff on every pass, so pt_buff -- the far
   // heavier buffer -- is what actually grows when the producer outruns the
   // estimator. metrics()["residual_points"] reports its depth at exit.
-  void apply_backpressure() {
-    RESPLE::LidarData& buffers = resple_->lidars_data.at(lidar_type_);
+  void apply_backpressure(const LidarStream& stream) {
+    RESPLE::LidarData& buffers = resple_->lidars_data.at(stream.type);
     // Snapshot the epoch *before* reading the queue depth: a dequeue landing
     // between the two only makes the wait return immediately.
     std::uint64_t epoch = resple_bridge::current_progress_epoch();
@@ -717,7 +834,7 @@ class RespleOdometry {
           "). Push more IMU before this sweep.");
   }
 
-  void validate_sweep(double timestamp, const FloatArray& points,
+  void validate_sweep(const LidarStream& stream, double timestamp, const FloatArray& points,
                       const DoubleArray& relative_times,
                       const py::object& lines, const py::object& tags) const {
     if (points.ndim() != 2 || (points.shape(1) != 3 && points.shape(1) != 4))
@@ -726,8 +843,10 @@ class RespleOdometry {
     if (relative_times.ndim() != 1 || relative_times.shape(0) != points.shape(0))
       throw py::value_error("relative_times must have shape (N,)");
     if (!std::isfinite(timestamp)) throw py::value_error("sweep timestamp must be finite");
-    if (timestamp <= last_lidar_stamp_)
-      throw py::value_error("sweep timestamps must be strictly increasing");
+    // Per stream: separate lidars are independent sensors whose sweeps
+    // interleave in any order, exactly as their ROS subscriptions would.
+    if (timestamp <= stream.last_stamp)
+      throw py::value_error("sweep timestamps must be strictly increasing per lidar");
 
     auto p = points.unchecked<2>();
     auto t = relative_times.unchecked<1>();
@@ -780,9 +899,9 @@ class RespleOdometry {
     return out;
   }
 
-  std::string lidar_name_;
-  std::string lidar_type_;
-  int scan_line_;
+  // Keyed by the `lidars` config name -- the identity the Python API uses.
+  // One entry per lidar *type*; see LidarStream.
+  std::map<std::string, LidarStream> streams_;
   int max_pending_sweeps_;
   double min_imu_lead_seconds_;
   rclcpp::Node::SharedPtr node_;
@@ -793,8 +912,9 @@ class RespleOdometry {
   std::exception_ptr worker_error_;
   std::int64_t imu_pushed_ = 0;
   double last_imu_stamp_ = -std::numeric_limits<double>::infinity();
+  // Max over all lidars; -inf until the first sweep of any of them is
+  // accepted. Per-lidar monotonicity lives in LidarStream::last_stamp.
   double last_lidar_stamp_ = -std::numeric_limits<double>::infinity();
-  std::int64_t last_absolute_point_stamp_ns_ = std::numeric_limits<std::int64_t>::min();
 };
 
 }  // namespace
@@ -803,20 +923,15 @@ PYBIND11_MODULE(_core, module) {
   module.doc() = "Offline host for pinned upstream RESPLE";
 
   py::class_<RespleOdometry>(module, "RespleOdometry")
-      .def(py::init<const py::dict&, const std::string&, std::string, int, float,
-                    const std::string&, const std::vector<double>&, const std::vector<double>&,
-                    double, int,
-                    double>(),
-           py::arg("parameters"), py::arg("lidar_name"), py::arg("lidar_type"),
-           py::arg("scan_line"), py::arg("blind"), py::arg("topic_lidar"),
-           py::arg("q_lb"), py::arg("t_lb"), py::arg("w_pt"),
+      .def(py::init<const py::dict&, const std::vector<py::dict>&, int, double>(),
+           py::arg("parameters"), py::arg("lidars"),
            py::arg("max_pending_sweeps") = 8,
            py::arg("min_imu_lead_seconds") = 0.0)
       .def("push_imu", &RespleOdometry::push_imu, py::arg("timestamp"),
            py::arg("acceleration"), py::arg("angular_velocity"))
       .def("push_lidar", &RespleOdometry::push_lidar, py::arg("timestamp"), py::arg("points"),
            py::arg("relative_times"), py::arg("lines") = py::none(),
-           py::arg("tags") = py::none())
+           py::arg("tags") = py::none(), py::arg("lidar") = std::string())
       .def("trajectory", &RespleOdometry::trajectory)
       .def("drain_map_batches", &RespleOdometry::drain_map_batches)
       .def("finish", &RespleOdometry::finish)

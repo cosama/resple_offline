@@ -23,21 +23,30 @@ class RespleOdometry:
         problems = cfg.validate()
         if problems:
             raise ValueError("invalid RespleConfig: " + "; ".join(problems))
-        lidar = cfg.lidars[0]
         self._cfg = cfg
         self._native = _RespleOdometry(
             parameters=cfg.native_parameters(),
-            lidar_name=lidar.name,
-            lidar_type=lidar.lidar_type,
-            scan_line=lidar.scan_line,
-            blind=lidar.blind,
-            topic_lidar=lidar.topic_lidar,
-            q_lb=list(lidar.q_lb),
-            t_lb=list(lidar.t_lb),
-            w_pt=lidar.w_pt,
+            lidars=[
+                {
+                    "name": lidar.name,
+                    "lidar_type": lidar.lidar_type,
+                    "topic_lidar": lidar.topic_lidar,
+                    "scan_line": int(lidar.scan_line),
+                    "blind": float(lidar.blind),
+                    "q_lb": list(map(float, lidar.q_lb)),
+                    "t_lb": list(map(float, lidar.t_lb)),
+                    "w_pt": float(lidar.w_pt),
+                }
+                for lidar in cfg.lidars
+            ],
             max_pending_sweeps=cfg.max_pending_sweeps,
             min_imu_lead_seconds=cfg.min_imu_lead_seconds,
         )
+
+    @property
+    def lidar_names(self) -> tuple[str, ...]:
+        """Configured lidar names, in `lidars` order -- push_lidar's `lidar=`."""
+        return tuple(lidar.name for lidar in self._cfg.lidars)
 
     def push_imu(self, timestamp: float, acceleration, angular_velocity) -> int:
         """Push one IMU sample. Timestamps must be strictly increasing.
@@ -58,6 +67,7 @@ class RespleOdometry:
         *,
         lines: np.ndarray | None = None,
         tags: np.ndarray | None = None,
+        lidar: str | None = None,
     ) -> int:
         """`points` is (N, 3) or (N, 4) [x, y, z, (intensity)]; `relative_times`
         is (N,) seconds from the source packet header timestamp. Injection
@@ -67,6 +77,13 @@ class RespleOdometry:
         ``lines`` and ``tags`` carry the raw Livox packet fields. They may be
         omitted for canonical inputs whose invalid driver points have already
         been removed; direct bag replay should provide them.
+
+        ``lidar`` names the configured profile this sweep came from (see
+        :attr:`lidar_names`); it may be omitted only when the session has a
+        single LiDAR. With several, each one's sweeps must actually be pushed:
+        upstream forms a measurement batch only once *every* configured LiDAR
+        has buffered points, so a starved stream stalls the estimator rather
+        than degrading to the others.
 
         Raises ValueError mentioning "insufficient IMU lead" when the IMU
         pushed so far does not cover this sweep -- including for the first
@@ -80,7 +97,8 @@ class RespleOdometry:
         if tags is not None:
             tags = np.ascontiguousarray(tags, dtype=np.int32)
         return self._native.push_lidar(
-            float(timestamp), points, relative_times, lines=lines, tags=tags
+            float(timestamp), points, relative_times, lines=lines, tags=tags,
+            lidar="" if lidar is None else str(lidar),
         )
 
     def trajectory(self) -> np.ndarray:

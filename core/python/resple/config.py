@@ -13,10 +13,12 @@ from __future__ import annotations
 from dataclasses import dataclass, fields
 from typing import Any
 
-# One lidar entry today (design decision: single LiDAR for phase 1), kept as
-# a list because upstream's own "lidars" parameter is a list and
-# Estimator/Association already support fusing several -- adding a second
-# entry later is a config/runner change, not a bridge rewrite.
+# Upstream's own "lidars" parameter is a list, and Estimator/Association fuse
+# every configured LiDAR into one spline (see e.g. upstream's
+# config_heap_testsite_hoenggerberg.yaml: ["livox", "hesai"]). Upstream keys
+# both `lidars` and `lidars_data` by lidar *type*, so a rig may hold at most
+# one entry per type -- validate() reports a collision rather than letting
+# upstream's map emplace silently drop the second one.
 _KNOWN_LIDAR_TYPES = {"Ouster", "Mid70Avia", "HAP360", "AviaResple", "Hesai", "Mid360Boxi"}
 
 
@@ -72,12 +74,24 @@ class RespleConfig:
         problems: list[str] = []
         if not self.lidars:
             problems.append("at least one lidar profile is required")
-        elif len(self.lidars) > 1:
-            problems.append(
-                "multi-lidar fusion is not implemented yet (single LiDAR only); "
-                f"got {len(self.lidars)} entries"
-            )
+        seen_names: dict[str, None] = {}
+        seen_types: dict[str, str] = {}
         for lidar in self.lidars:
+            if lidar.name in seen_names:
+                problems.append(f"duplicate lidar name {lidar.name!r}")
+            seen_names[lidar.name] = None
+            # upstream RESPLE.cpp: `lidars.emplace(lidar.type, lidar)` and the
+            # matching lidars_data emplace. std::map::emplace keeps the first
+            # entry, so a second profile of the same type would be dropped and
+            # its sweeps fused into the first one's buffers.
+            if lidar.lidar_type in seen_types:
+                problems.append(
+                    f"lidars {seen_types[lidar.lidar_type]!r} and {lidar.name!r} both use "
+                    f"lidar_type {lidar.lidar_type!r}; upstream RESPLE keys its per-lidar "
+                    "configuration and buffers by type, so at most one profile per type"
+                )
+            else:
+                seen_types[lidar.lidar_type] = lidar.name
             if lidar.lidar_type not in _KNOWN_LIDAR_TYPES:
                 problems.append(
                     f"lidar '{lidar.name}': unknown lidar_type {lidar.lidar_type!r}, "

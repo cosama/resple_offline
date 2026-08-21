@@ -37,7 +37,12 @@ structurally replaces the ROS graph:
   sweep representation, and injection
   begins at RESPLE's internal `imu_int_buff` and
   `lidars_data[type].{pc_buff,t_buff}` buffers rather than at ROS sensor
-  callbacks. `push_lidar` selects the configured upstream callback behavior:
+  callbacks. One producer-side stream per configured LiDAR carries the state
+  each upstream callback keeps in a function-local `static` (the cross-frame
+  `last_t_ns`), which is per-type because upstream has one callback per type;
+  `push_lidar(..., lidar=<name>)` selects it, and the name may be omitted only
+  for a single-LiDAR session. `push_lidar` selects the configured upstream
+  callback behavior:
   Ouster/Hesai/Mid360Boxi raw-index thinning and Mid70Avia/HAP360/AviaResple
   line/tag validation, valid-point thinning, first-point skip, and duplicate
   suppression, plus each callback's blind/time rules and Ouster-only
@@ -68,13 +73,26 @@ The Python resolver accepts upstream ROS2 parameter files directly, including
 the `/** -> ros__parameters`, named `lidars` profiles, transport topics, and
 `if_lidar_only` layout. The legacy flat benchmark config remains accepted.
 Explicit profiles are authoritative; metadata/URDF fallback is used only to
-synthesize a profile for a legacy config without `lidars`. Multi-LiDAR input
-is still rejected explicitly by the Python wrapper rather than silently
-collapsing an upstream configuration. So is a profile mapping that no
-`lidars` entry selects (upstream's own
+synthesize a profile for a legacy config without `lidars`. A profile mapping
+that no `lidars` entry selects is rejected (upstream's own
 `config_jungfraujoch_tunnel_small.yaml` keeps a `livox:` block while
 selecting only `["hesai"]`, and upstream simply never reads it): a stale
 profile is reported by name rather than ignored.
+
+Multi-LiDAR configurations are supported: upstream fuses every configured
+LiDAR into one spline (its own `config_heap_testsite_hoenggerberg.yaml`
+selects `["livox", "hesai"]`), and the bridge carries them through as
+independent producer streams. Two profiles of the *same* `lidar_type` are
+refused by both layers -- upstream's `lidars`/`lidars_data` are `std::map`s
+keyed by type, so `emplace` would silently drop the second profile and fuse
+its sweeps into the first one's buffers with the wrong extrinsics. Every
+configured LiDAR must actually be fed: `collectMeasurements()` forms a batch
+only once *all* of them have buffered points, so a starved stream stalls the
+estimator rather than degrading to the others.
+`metrics()["per_lidar"]` reports each stream's sweep and point counts so that
+is visible. `scripts/run_resple.py` rejects a multi-LiDAR config outright,
+because a prepared dataset carries a single `points.parquet` and there is no
+second stream to feed.
 
 `resolve()` also fills the `/offline/<name>` and `/offline/imu` topic
 placeholders, so `report()`, the materialized upstream YAML and the native
@@ -88,11 +106,20 @@ would never consume -- `processData`'s IMU drain is behind
 
 ## Patch series (`patches/integration/`)
 
-| Patch | What |
-|---|---|
-| `01-bridge-visibility.patch` | Widens `RESPLE`'s `private:` section (buffers, `spline`, callbacks) to `public:` so `cpp/bindings.cpp` can inject sensor data and read spline state from outside the class. No behavior change. |
-| `02-finish-condition.patch` | `processData()`'s loop is `while (true)` upstream -- real ROS nodes are killed, not joined, so there is no exit condition at all. Gives it a state-based one: the worker stops after the first pass that *began* with input closed and moved nothing. The flag is sampled at the top of the pass, never at the bottom, so a push landing after the pass scanned the buffers cannot be dropped. Also pops the raw queues under their own mutex, notifies the bridge on each dequeue (this is what releases producer backpressure), and calls the barrier from patch 03. |
-| `03-deterministic-ikdtree-rebuild.patch` | Ports DALI-SLAM's compatible ikd-tree rebuild quiescence barrier and initializes the rebuild thread handle. The processing loop waits at each measurement-batch boundary so correspondence searches never run against an in-flight background rebuild. |
+One patch per upstream file, named after it. This keeps the mapping from
+"upstream file changed" to "patch to re-derive" one-to-one when the pin moves.
+
+A patch therefore carries several unrelated concerns. So that grouping by file
+does not hide the "why", **every hunk explains itself in the source**, tagged
+`resple_bridge:`. After staging, `grep -rn 'resple_bridge:' build/upstream_staged/`
+enumerates the entire local delta -- added calls and their rationale -- in the
+file a reader is actually compiling. The patch headers are only an index; the
+reasoning has a single home, at the sites, so the two cannot drift apart.
+
+| Patch | Upstream file(s) | What |
+|---|---|---|
+| `01-resple-node.patch` | `src/RESPLE.cpp` | Six grouped changes, enumerated in the patch header: (1) widens `private:` to `public:` so `cpp/bindings.cpp` can inject sensor data and read spline state; (2) gives `processData()`'s `while (true)` loop a state-based exit -- the worker stops after the first pass that *began* with input closed and moved nothing, the flag sampled at the top of the pass so a push landing mid-pass cannot be dropped; (3) pops the raw queues under their own mutex and notifies the bridge on each dequeue, which is what releases producer backpressure; (4) calls the ikd-tree quiescence barrier at each measurement-batch boundary; (5) two `initialization()` determinism fixes -- the initial map is built only from the *complete* fixed 100 ms window, and `propRCP(start_t_ns)` moves below both retry gates so it runs exactly once (on a spline that already covers `t` its whole effect is `cov_rcp += cov_sys`, so one call per retry pass scaled the initial covariance with a scheduling-dependent pass count); (6) fails immediately, with the relevant density settings, when a complete window holds fewer than the required 100 downsampled points. |
+| `02-ikd-tree.patch` | `include/ikd-Tree/ikd_Tree.{h,cpp}` | Ports DALI-SLAM's compatible ikd-tree rebuild quiescence barrier and initializes the rebuild thread handle, so correspondence searches never run against an in-flight background rebuild. Declaration and definition are one change and neither compiles alone, so both files share a patch. |
 
 ## Known limitations / open validation
 
@@ -163,10 +190,18 @@ would never consume -- `processData`'s IMU drain is behind
   Batch composition itself is *not* timing-dependent: `collectMeasurements()`
   cuts on a spline-derived time window, and the OpenMP loops in `Estimator.h`
   are element-wise writes with serial assembly, so no FP-reduction ordering is
-  involved. `core/tests/test_lifecycle.py` asserts bit-identical trajectories
-  over 3 subprocess runs of the synthetic scene. Large real-data repeated
-  replay is still recommended: that scene may not trigger large subtree
-  rebuilds.
+  involved. Two more were found and closed when multi-LiDAR support was
+  added: several LiDARs make `initialization()` take a scheduling-dependent
+  number of passes, which exposed both (see `01-resple-node.patch`) --
+  (4) the initial map was seeded from a partially arrived 100 ms window, and
+  (5) `propRCP` inflated the initial covariance once per retry pass (2 to 6
+  passes across runs on the two-LiDAR synthetic scene, giving 4 distinct
+  trajectories). Neither changes the single-LiDAR result: that scene's
+  trajectory hash is unchanged across the fix.
+  `core/tests/test_lifecycle.py` asserts bit-identical trajectories
+  over 3 subprocess runs of the synthetic scene, single- and two-LiDAR.
+  Large real-data repeated replay is still recommended: that scene may not
+  trigger large subtree rebuilds.
 
 ## Upgrade procedure
 

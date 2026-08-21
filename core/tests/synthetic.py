@@ -66,3 +66,49 @@ def run_stationary_session(odom, duration: float = 3.0, imu_hz: float = 200.0,
             sweep_index += 1
             next_lidar_t += 1.0 / lidar_hz
     return odom.finish()
+
+
+# Body-frame position of the second LiDAR in the multi-lidar scene. Upstream's
+# LidarConfig computes q_bl = q_lb^-1 and t_bl = q_lb^-1 * (-t_lb), and
+# Association::pointBodyToWorld applies p_body = q_bl * p_lidar + t_bl -- so
+# with an identity q_lb, t_lb is the negated body-frame offset of the sensor.
+SECOND_LIDAR_OFFSET = np.array([0.3, -0.2, 0.1])
+
+
+def second_lidar_extrinsics() -> tuple[tuple[float, float, float, float], list[float]]:
+    """(q_lb, t_lb) placing a LiDAR at SECOND_LIDAR_OFFSET in the body frame."""
+    return (1.0, 0.0, 0.0, 0.0), list(-SECOND_LIDAR_OFFSET)
+
+
+def run_stationary_multi_lidar_session(odom, duration: float = 3.0, imu_hz: float = 200.0,
+                                       lidar_hz: float = 10.0) -> dict:
+    """Feed the same stationary box room through two co-mounted LiDARs.
+
+    The two streams are staggered by half a sweep period rather than pushed in
+    lockstep, so the run actually exercises interleaved arrival. Both must be
+    fed: upstream's collectMeasurements() forms a batch only once *every*
+    configured LiDAR has buffered points.
+
+    `odom.lidar_names` supplies the names; the second one is placed at
+    SECOND_LIDAR_OFFSET, so its points only agree with the first one's walls if
+    its extrinsics are actually applied.
+    """
+    assert imu_hz * IMU_LEAD_SECONDS >= 15, "first sweep would race gravity initialization"
+    first, second = odom.lidar_names
+    # (name, sensor position in the body frame, next release time)
+    streams = [[first, np.zeros(3), 0.0], [second, SECOND_LIDAR_OFFSET, 0.5 / lidar_hz]]
+    sweep_index = 0
+    for i in range(int(duration * imu_hz) + 50):
+        stamp = i / imu_hz
+        odom.push_imu(stamp, [0.0, 0.0, GRAVITY], [0.0, 0.0, 0.0])
+        while True:
+            stream = min(streams, key=lambda entry: entry[2])
+            name, position, next_t = stream
+            if next_t > stamp - IMU_LEAD_SECONDS or next_t >= duration:
+                break
+            world_points, relative_times = box_room_sweep(position, seed=sweep_index)
+            odom.push_lidar(next_t, world_points - position.astype(np.float32),
+                            relative_times, lidar=name)
+            sweep_index += 1
+            stream[2] = next_t + 1.0 / lidar_hz
+    return odom.finish()

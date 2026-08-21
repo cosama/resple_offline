@@ -126,3 +126,107 @@ def test_upstream_lidar_only_mode_commits_finite_poses():
     lines = dict(line.split(" ", 1) for line in proc.stdout.splitlines() if " " in line)
     assert int(lines["POSES"]) > 0
     assert lines["FINITE"] == "True"
+
+
+# Two LiDARs of *different* types: upstream keys `lidars`/`lidars_data` by
+# type, so that is also the granularity at which a rig can be described.
+_MULTI_LIDAR_SCRIPT = textwrap.dedent("""
+    import hashlib
+    import json
+    import numpy as np
+    from resple import RespleOdometry, config as cfgmod
+    from tests.synthetic import run_stationary_multi_lidar_session, second_lidar_extrinsics
+
+    q_lb, t_lb = second_lidar_extrinsics()
+    cfg = cfgmod.resolve({
+        "lidars": [
+            {"name": "front", "lidar_type": "Ouster", "scan_line": 64, "blind": 0.3,
+             "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01},
+            {"name": "side", "lidar_type": "Hesai", "scan_line": 32, "blind": 0.3,
+             "q_lb": q_lb, "t_lb": t_lb, "w_pt": 0.01},
+        ],
+    })
+    odom = RespleOdometry(cfg)
+    result = run_stationary_multi_lidar_session(odom)
+    traj = np.ascontiguousarray(result["trajectory"], dtype=np.float64)
+    metrics = result["metrics"]
+    print("POSES", traj.shape[0])
+    print("FINITE", bool(np.isfinite(traj).all()))
+    print("RESIDUAL", metrics["residual_sweeps"])
+    # The sensor is stationary at the body origin for the whole scene, so a
+    # rig whose second LiDAR's extrinsics were ignored would drag the estimate
+    # off origin rather than merely look different.
+    print("MAXDIST", float(np.abs(traj[:, 1:4]).max()))
+    print("PERLIDAR", json.dumps({
+        name: entry["sweeps_pushed"] for name, entry in metrics["per_lidar"].items()
+    }, sort_keys=True))
+    print("TRAJ", hashlib.sha256(traj.tobytes()).hexdigest())
+""")
+
+_SAME_TYPE_SCRIPT = textwrap.dedent("""
+    from resple import RespleOdometry, config as cfgmod
+
+    cfg = cfgmod.resolve({
+        "lidars": [
+            {"name": "front", "lidar_type": "Ouster", "scan_line": 64, "blind": 0.3,
+             "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01},
+            {"name": "rear", "lidar_type": "Ouster", "scan_line": 64, "blind": 0.3,
+             "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (1.0, 0.0, 0.0), "w_pt": 0.01},
+        ],
+    })
+    print("PROBLEMS", "|".join(cfg.validate()))
+    RespleOdometry(cfg)
+""")
+
+
+def _run_multi_lidar() -> dict:
+    proc = subprocess.run(
+        [sys.executable, "-c", _MULTI_LIDAR_SCRIPT],
+        cwd=CORE_DIR, capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return dict(line.split(" ", 1) for line in proc.stdout.splitlines() if " " in line)
+
+
+def test_two_lidars_fuse_into_one_trajectory():
+    lines = _run_multi_lidar()
+    assert int(lines["POSES"]) > 0, "expected at least one committed pose"
+    assert lines["FINITE"] == "True"
+    assert lines["RESIDUAL"] == "0", "worker stopped with sweeps still buffered"
+    # Both streams reached the estimator; a starved one stalls it silently.
+    import json as _json
+    per_lidar = _json.loads(lines["PERLIDAR"])
+    assert set(per_lidar) == {"front", "side"}
+    assert all(count > 0 for count in per_lidar.values()), per_lidar
+    # Verified discriminating: zeroing the second LiDAR's t_lb takes this from
+    # ~0.011 m to ~0.21 m, so the bound is not merely "did not diverge".
+    assert float(lines["MAXDIST"]) < 0.05, "stationary rig drifted; check extrinsics handling"
+
+
+def test_two_lidars_are_deterministic():
+    """Bit-exact over the whole trajectory, like the single-LiDAR case.
+
+    Two LiDARs make initialization take a scheduling-dependent number of
+    passes, which is what exposed propRCP's per-call covariance inflation
+    (see 01-resple-node.patch); a MAXDIST-only check would have caught
+    it here only by luck.
+    """
+    runs = [_run_multi_lidar()["TRAJ"] for _ in range(3)]
+    assert len(set(runs)) == 1, "identical two-lidar input produced different output"
+
+
+def test_two_lidars_of_the_same_type_are_rejected():
+    """Upstream's lidars/lidars_data maps are keyed by type, not by name.
+
+    A second profile of the same type is dropped by std::map::emplace, so its
+    sweeps would be silently fused into the first one's buffers with the wrong
+    extrinsics. Both layers must say so by name.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-c", _SAME_TYPE_SCRIPT],
+        cwd=CORE_DIR, capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode != 0
+    problems = next(line for line in proc.stdout.splitlines() if line.startswith("PROBLEMS"))
+    assert "both use lidar_type 'Ouster'" in problems, problems
+    assert "invalid RespleConfig" in proc.stderr
