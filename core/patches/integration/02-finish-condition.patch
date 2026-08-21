@@ -13,7 +13,11 @@ outside it, notifies the bridge on every real dequeue so push_lidar's bounded
 backpressure wait is released by progress rather than by polling, and waits
 for ikd-tree rebuild quiescence at each measurement-batch boundary (see
 03-deterministic-ikdtree-rebuild.patch) so correspondence searches do not
-depend on scheduler timing.
+depend on scheduler timing. If the fixed 100 ms initial-map window is already
+complete but contains fewer than the 100 required downsampled points, fail
+immediately with the relevant density settings. Additional input cannot change
+that closed window, so silently buffering the rest of the dataset is both
+misleading and wasteful.
 
 --- src/RESPLE.cpp
 +++ src/RESPLE.cpp
@@ -107,3 +111,30 @@ depend on scheduler timing.
          }
      }    
  
+@@ -660,6 +684,9 @@
+             }
+             int feats_down_size = 0;
++            bool init_window_complete = true;
+             for (const auto& [lidar_name, lidar_data] : lidars_data) {
++                init_window_complete = init_window_complete &&
++                    lidar_data.pt_buff.back().time_ns >= start_t_ns + 1e8;
+                 for (size_t i = 0; i < lidar_data.pt_buff.size(); i++) {
+                     if (lidar_data.pt_buff[i].time_ns < start_t_ns + 1e8) {
+                         feats_down_size++;
+@@ -670,6 +697,15 @@
+                     }
+                 }
+             }            
+             if(feats_down_size < 100) {
++                if (init_window_complete) {
++                    throw std::runtime_error(
++                        "RESPLE initial-map initialization cannot proceed: first 100 ms contains " +
++                        std::to_string(feats_down_size) +
++                        " points after scan downsampling, but at least 100 are required "
++                        "(ds_scan_voxel=" + std::to_string(ds_filter_body.getLeafSize()[0]) +
++                        ", point_filter_num=" + std::to_string(point_filter_num) + "). "
++                        "Use a smaller ds_scan_voxel/point_filter_num or change the initialization policy.");
++                }
+                 return false;
+             }            
+             pc_world.clear();

@@ -43,6 +43,22 @@ _SESSION_SCRIPT = textwrap.dedent("""
     print("TRAJ", hashlib.sha256(traj.tobytes()).hexdigest())
 """)
 
+_SPARSE_INITIAL_MAP_SCRIPT = textwrap.dedent("""
+    import numpy as np
+    from resple import RespleOdometry, config as cfgmod
+    from tests.synthetic import run_stationary_session
+
+    cfg = cfgmod.resolve({
+        "ds_scan_voxel": 100.0,
+        "lidars": [{
+            "name": "lidar0", "lidar_type": "Ouster", "scan_line": 64, "blind": 0.3,
+            "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01,
+        }],
+    })
+    odom = RespleOdometry(cfg)
+    run_stationary_session(odom)
+""")
+
 
 def _run_session() -> str:
     proc = subprocess.run(
@@ -70,3 +86,15 @@ def test_stationary_session_drains_every_pushed_sweep():
 def test_stationary_session_is_deterministic():
     runs = [_run_session() for _ in range(3)]
     assert len(set(runs)) == 1, "identical synthetic input produced different output"
+
+
+def test_sparse_initial_map_fails_with_actionable_error():
+    proc = subprocess.run(
+        [sys.executable, "-c", _SPARSE_INITIAL_MAP_SCRIPT],
+        cwd=CORE_DIR, capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode != 0
+    assert "initial-map initialization cannot proceed" in proc.stderr
+    assert "first 100 ms contains" in proc.stderr
+    assert "ds_scan_voxel=100.000000" in proc.stderr
+    assert "point_filter_num=1" in proc.stderr
