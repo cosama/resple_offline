@@ -59,6 +59,23 @@ _SPARSE_INITIAL_MAP_SCRIPT = textwrap.dedent("""
     run_stationary_session(odom)
 """)
 
+_LIDAR_ONLY_SCRIPT = textwrap.dedent("""
+    import numpy as np
+    from resple import RespleOdometry, config as cfgmod
+    from tests.synthetic import run_stationary_session
+
+    cfg = cfgmod.resolve({
+        "if_lidar_only": True,
+        "lidars": [{
+            "name": "lidar0", "lidar_type": "Ouster", "scan_line": 64, "blind": 0.3,
+            "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01,
+        }],
+    })
+    result = run_stationary_session(RespleOdometry(cfg), with_imu=False)
+    print("POSES", result["trajectory"].shape[0])
+    print("FINITE", bool(np.isfinite(result["trajectory"]).all()))
+""")
+
 
 def _run_session() -> str:
     proc = subprocess.run(
@@ -98,3 +115,14 @@ def test_sparse_initial_map_fails_with_actionable_error():
     assert "first 100 ms contains" in proc.stderr
     assert "ds_scan_voxel=100.000000" in proc.stderr
     assert "point_filter_num=1" in proc.stderr
+
+
+def test_upstream_lidar_only_mode_commits_finite_poses():
+    proc = subprocess.run(
+        [sys.executable, "-c", _LIDAR_ONLY_SCRIPT], cwd=CORE_DIR,
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    lines = dict(line.split(" ", 1) for line in proc.stdout.splitlines() if " " in line)
+    assert int(lines["POSES"]) > 0
+    assert lines["FINITE"] == "True"

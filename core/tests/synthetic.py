@@ -44,15 +44,22 @@ IMU_LEAD_SECONDS = 0.1
 
 
 def run_stationary_session(odom, duration: float = 3.0, imu_hz: float = 200.0,
-                           lidar_hz: float = 10.0) -> dict:
-    """Feed a stationary box-room scene through `odom` (a resple.RespleOdometry) and finish()."""
+                           lidar_hz: float = 10.0, with_imu: bool = True) -> dict:
+    """Feed a stationary box-room scene through `odom` (a resple.RespleOdometry) and finish().
+
+    `with_imu=False` drives a LiDAR-only (if_lidar_only=true) session, which
+    refuses push_imu outright: upstream never drains the IMU buffer in that
+    mode. The IMU clock still paces sweep release so both modes replay the
+    same sweeps at the same stamps.
+    """
     assert imu_hz * IMU_LEAD_SECONDS >= 15, "first sweep would race gravity initialization"
     next_lidar_t = 0.0
     sweep_index = 0
     n_imu = int(duration * imu_hz) + 50
     for i in range(n_imu):
         stamp = i / imu_hz
-        odom.push_imu(stamp, [0.0, 0.0, GRAVITY], [0.0, 0.0, 0.0])
+        if with_imu:
+            odom.push_imu(stamp, [0.0, 0.0, GRAVITY], [0.0, 0.0, 0.0])
         while next_lidar_t <= stamp - IMU_LEAD_SECONDS and next_lidar_t < duration:
             points, relative_times = box_room_sweep(np.zeros(3), seed=sweep_index)
             odom.push_lidar(next_lidar_t, points, relative_times)

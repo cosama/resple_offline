@@ -33,18 +33,18 @@ structurally replaces the ROS graph:
   `cpp/bindings.cpp`'s `apply_parameters`/`configure_lidar` set every key
   with its exact upstream C++ type rather than sniffing types from a generic
   dict.
-- **Sensor input**: `create_subscription<T>()` is a no-op. Input is the
-  benchmark's canonical/preprocessed sweep representation, and injection
+- **Sensor input**: `create_subscription<T>()` is a no-op. Input is an offline
+  sweep representation, and injection
   begins at RESPLE's internal `imu_int_buff` and
   `lidars_data[type].{pc_buff,t_buff}` buffers rather than at ROS sensor
-  callbacks. `push_lidar` reproduces `ousterLidarCallback`'s per-point filter
-  chain in the same order and against the same reference values: raw-index
-  `point_filter_num`, blind range, the strictly-increasing absolute-stamp test
-  against the previous frame's last *kept* point (upstream's `static int64_t
-  last_t_ns`), ms relative-time encoding in `intensity`, reflectivity in
-  `curvature`, and the Ouster `lidar_time_offset` shift. `blind` is read from
-  the config RESPLE itself parsed, not passed in alongside it. Livox line/tag
-  packet fields do not exist in the prepared schema and are not synthesized.
+  callbacks. `push_lidar` selects the configured upstream callback behavior:
+  Ouster/Hesai/Mid360Boxi raw-index thinning and Mid70Avia/HAP360/AviaResple
+  line/tag validation, valid-point thinning, first-point skip, and duplicate
+  suppression, plus each callback's blind/time rules and Ouster-only
+  `lidar_time_offset`. Raw Livox `line`/`tag` arrays are optional at the Python
+  API for future direct bag replay. The current prepared Parquet schema lacks
+  them and packet identity, so omission means "already driver-valid" and
+  cannot reconstruct filtering discarded during preparation.
   Everything downstream -- `processData`'s PointData construction, IEKF
   update, and map maintenance -- remains upstream logic.
 - **Results**: `create_publisher<T>()` returns a `Publisher<T>` whose
@@ -61,6 +61,30 @@ structurally replaces the ROS graph:
   a second object file, which would ODR-violate on those globals.
 
 This avoids a hand-authored split of ROS I/O from the algorithm body.
+
+## Configuration compatibility
+
+The Python resolver accepts upstream ROS2 parameter files directly, including
+the `/** -> ros__parameters`, named `lidars` profiles, transport topics, and
+`if_lidar_only` layout. The legacy flat benchmark config remains accepted.
+Explicit profiles are authoritative; metadata/URDF fallback is used only to
+synthesize a profile for a legacy config without `lidars`. Multi-LiDAR input
+is still rejected explicitly by the Python wrapper rather than silently
+collapsing an upstream configuration. So is a profile mapping that no
+`lidars` entry selects (upstream's own
+`config_jungfraujoch_tunnel_small.yaml` keeps a `livox:` block while
+selecting only `["hesai"]`, and upstream simply never reads it): a stale
+profile is reported by name rather than ignored.
+
+`resolve()` also fills the `/offline/<name>` and `/offline/imu` topic
+placeholders, so `report()`, the materialized upstream YAML and the native
+run all name the same topic instead of native inventing a fallback for an
+empty string nobody chose (ARCHITECTURE.md #7). They are placeholders: set
+real topics before handing a materialized config to upstream RESPLE.
+
+In LiDAR-only mode `push_imu` raises rather than accepting samples upstream
+would never consume -- `processData`'s IMU drain is behind
+`if (!if_lidar_only ...)`, so they would accumulate unboundedly.
 
 ## Patch series (`patches/integration/`)
 

@@ -28,15 +28,18 @@ class LidarProfile:
     blind: float
     q_lb: tuple[float, float, float, float]  # (w, x, y, z)
     t_lb: tuple[float, float, float]
+    topic_lidar: str = ""
     w_pt: float = 0.01
 
 
 @dataclass(frozen=True)
 class RespleConfig:
-    """One resolved RESPLE run configuration (LIO mode; Estimator<30>)."""
+    """One resolved RESPLE run configuration."""
 
     lidars: tuple[LidarProfile, ...]
 
+    topic_imu: str = ""
+    if_lidar_only: bool = False
     knot_hz: int = 100
     ds_scan_voxel: float = 0.5
     ds_lm_voxel: float = 0.5
@@ -86,6 +89,8 @@ class RespleConfig:
                 problems.append(f"lidar '{lidar.name}': t_lb must have length 3")
             if lidar.blind < 0:
                 problems.append(f"lidar '{lidar.name}': blind must be >= 0")
+            if lidar.scan_line <= 0:
+                problems.append(f"lidar '{lidar.name}': scan_line must be positive")
         if self.knot_hz <= 0:
             problems.append("knot_hz must be positive")
         if self.num_points_upd <= 0:
@@ -106,6 +111,8 @@ class RespleConfig:
         constructor arguments, not through this dict -- see __init__.py.
         """
         return {
+            "topic_imu": self.topic_imu,
+            "if_lidar_only": self.if_lidar_only,
             "knot_hz": self.knot_hz,
             "ds_scan_voxel": self.ds_scan_voxel,
             "ds_lm_voxel": self.ds_lm_voxel,
@@ -140,6 +147,7 @@ class RespleConfig:
                 "lidar_type": lidar.lidar_type,
                 "scan_line": lidar.scan_line,
                 "blind": lidar.blind,
+                "topic_lidar": lidar.topic_lidar,
                 "q_lb": list(lidar.q_lb),
                 "t_lb": list(lidar.t_lb),
                 "w_pt": lidar.w_pt,
@@ -147,6 +155,93 @@ class RespleConfig:
             for lidar in self.lidars
         ]
         return data
+
+    def upstream_parameters(self) -> dict[str, Any]:
+        """Return the ROS2 parameter mapping accepted by upstream RESPLE."""
+        params = self.native_parameters()
+        # Offline producer/consumer controls are intentionally not emitted:
+        # upstream RESPLE has no corresponding ROS parameters.
+        params["lidars"] = [lidar.name for lidar in self.lidars]
+        for lidar in self.lidars:
+            params[lidar.name] = {
+                "topic_lidar": lidar.topic_lidar,
+                "lidar_type": lidar.lidar_type,
+                "scan_line": lidar.scan_line,
+                "blind": lidar.blind,
+                "q_lb": list(lidar.q_lb),
+                "t_lb": list(lidar.t_lb),
+                "w_pt": lidar.w_pt,
+            }
+        return params
+
+    def upstream_yaml_mapping(self) -> dict[str, Any]:
+        return {"/**": {"ros__parameters": self.upstream_parameters()}}
+
+
+def normalize_overrides(payload: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalize legacy-flat or upstream ROS2 configuration to one mapping.
+
+    Upstream represents ``lidars`` as a list of profile names whose mappings
+    are siblings under ``ros__parameters``.  The bridge's typed model stores
+    the same information as a list of profile mappings.
+    """
+    if payload is None:
+        return {}
+    if not isinstance(payload, dict):
+        raise ValueError("RESPLE config must be a mapping")
+    envelopes = [
+        key for key, value in payload.items()
+        if isinstance(value, dict) and "ros__parameters" in value
+    ]
+    if envelopes:
+        if len(envelopes) != 1 or len(payload) != 1:
+            raise ValueError("RESPLE config must contain exactly one ROS2 parameter envelope")
+        envelope = payload[envelopes[0]]
+        params = envelope["ros__parameters"]
+        if not isinstance(params, dict):
+            raise ValueError("ros__parameters must be a mapping")
+        result = dict(params)
+    else:
+        result = dict(payload)
+
+    lidars_raw = result.get("lidars")
+    if isinstance(lidars_raw, (list, tuple)) and lidars_raw and all(
+        isinstance(name, str) for name in lidars_raw
+    ):
+        profiles = []
+        seen: set[str] = set()
+        for name in lidars_raw:
+            if name in seen:
+                raise ValueError(f"duplicate lidar profile name: {name!r}")
+            seen.add(name)
+            profile = result.pop(name, None)
+            if not isinstance(profile, dict):
+                raise ValueError(f"lidar profile {name!r} must be a mapping")
+            required = {"topic_lidar", "lidar_type", "scan_line", "q_lb", "t_lb", "w_pt"}
+            missing = sorted(required - set(profile))
+            if missing:
+                raise ValueError(
+                    f"upstream lidar profile {name!r} is missing required field(s): {missing}"
+                )
+            profiles.append({"name": name, **profile})
+        result["lidars"] = profiles
+        # A sibling mapping that no `lidars` entry selects is a lidar profile
+        # upstream silently never reads -- e.g. upstream's own
+        # config_jungfraujoch_tunnel_small.yaml keeps a `livox:` block while
+        # selecting only `["hesai"]`. Rejecting it is deliberate (a stale
+        # profile is far more often a mistake than an intent), but it must be
+        # named for what it is: resolve()'s generic unknown-field error would
+        # send the reader hunting for a mistyped scalar parameter instead.
+        stray = sorted(
+            key for key, value in result.items()
+            if isinstance(value, dict) and key != "lidars"
+        )
+        if stray:
+            raise ValueError(
+                f"lidar profile(s) {stray} are defined but not listed in "
+                f"lidars: {list(lidars_raw)}; remove them or add them to the list"
+            )
+    return result
 
 
 def resolve(overrides: dict[str, Any] | None = None) -> RespleConfig:
@@ -156,7 +251,7 @@ def resolve(overrides: dict[str, Any] | None = None) -> RespleConfig:
     LidarProfile's fields; everything else overrides a scalar RespleConfig
     field by name.
     """
-    overrides = dict(overrides or {})
+    overrides = normalize_overrides(overrides)
     lidars_raw = overrides.pop("lidars", None)
     if not lidars_raw:
         raise ValueError("resolve() requires at least one entry in 'lidars'")
@@ -168,10 +263,27 @@ def resolve(overrides: dict[str, Any] | None = None) -> RespleConfig:
             blind=float(entry.get("blind", 0.5)),
             q_lb=tuple(entry.get("q_lb", (1.0, 0.0, 0.0, 0.0))),
             t_lb=tuple(entry.get("t_lb", (0.0, 0.0, 0.0))),
+            # Resolve the offline placeholder here rather than in
+            # bindings.cpp's configure_lidar, so report(), the materialized
+            # upstream YAML and the native run all name the same topic
+            # (ARCHITECTURE.md #7). An empty string reaches upstream as an
+            # invalid topic name; the placeholder at least reads as one.
+            topic_lidar=str(entry.get("topic_lidar") or f"/offline/{entry['name']}"),
             w_pt=float(entry.get("w_pt", 0.01)),
         )
         for entry in lidars_raw
     )
+    if not overrides.get("topic_imu"):
+        overrides["topic_imu"] = "/offline/imu"
+    # These are declared tuple[float, float, float]; YAML and
+    # native_parameters() both hand them over as lists. Coerce so the frozen
+    # dataclass actually holds the type it advertises (and stays hashable and
+    # comparable -- config == resolve(config.upstream_yaml_mapping()) is only
+    # true if it does). Non-sequences are left for validate() to report.
+    for key in ("cov_acc", "cov_gyro", "cov_ba", "cov_bg"):
+        value = overrides.get(key)
+        if isinstance(value, (list, tuple)):
+            overrides[key] = tuple(float(component) for component in value)
     known = {f.name for f in fields(RespleConfig)} - {"lidars"}
     unknown = set(overrides) - known
     if unknown:
