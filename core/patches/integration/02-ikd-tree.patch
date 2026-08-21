@@ -1,0 +1,73 @@
+include/ikd-Tree/{ikd_Tree.h,ikd_Tree.cpp} -- the vendored ikd-tree.
+
+One patch per upstream file; the declaration and its definition are one
+change and neither compiles without the other, so both files are here.
+
+The pinned RESPLE ikd-tree is the same lineage/version as DALI-SLAM's. Its
+background subtree rebuild may otherwise begin between measurement batches
+and make correspondence searches depend on scheduler timing. Expose a
+quiescence barrier (called from processData, see 01-resple-node.patch) and
+initialize pthread_t so the existing conditional join is defined if thread
+creation fails.
+
+The barrier also covers a rebuild queued in Rebuild_Ptr before the background
+worker acquires rebuild_ptr_mutex_lock. The estimator thread is the only
+rebuild scheduler at this boundary, so no new job can be queued while it waits.
+
+Scope: this makes the tree quiescent for the estimator's own correspondence
+searches, which is where a mid-rebuild search would change the result (tree
+*contents* stay consistent regardless -- Rebuild_Logger replays operations
+that land during a rebuild). It does not cover Add_Points' internal
+downsample searches, which can run against a rebuild that Add_Points itself
+triggered earlier in the same mapIncremental() call.
+
+--- include/ikd-Tree/ikd_Tree.h
++++ include/ikd-Tree/ikd_Tree.h
+@@ -258,7 +258,7 @@
+     // Multi-thread Tree Rebuild
+     bool termination_flag = false;
+     bool rebuild_flag = false;
+-    pthread_t rebuild_thread;
++    pthread_t rebuild_thread{};
+     pthread_mutex_t termination_flag_mutex_lock, rebuild_ptr_mutex_lock, working_flag_mutex, search_flag_mutex;
+     pthread_mutex_t rebuild_logger_mutex_lock, points_deleted_rebuild_mutex_lock;
+     // queue<Operation_Logger_Type> Rebuild_Logger;
+@@ -308,6 +308,7 @@
+ public:
+     KD_TREE(float delete_param = 0.5, float balance_param = 0.6, float box_length = 0.2);
+     ~KD_TREE();
++    void wait_for_pending_rebuild();  // resple_bridge: see ikd_Tree.cpp
+     void Set_delete_criterion_param(float delete_param)
+     {
+         delete_criterion_param = delete_param;
+--- include/ikd-Tree/ikd_Tree.cpp
++++ include/ikd-Tree/ikd_Tree.cpp
+@@ -219,6 +219,28 @@
+ }
+ 
+ template <typename PointType>
++// resple_bridge: quiescence barrier for the offline bridge -- blocks until no
++// background subtree rebuild is pending or in flight, so a correspondence
++// search never races one. Called per measurement batch (01-resple-node.patch).
++void KD_TREE<PointType>::wait_for_pending_rebuild()
++{
++    while (true)
++    {
++        pthread_mutex_lock(&rebuild_ptr_mutex_lock);
++        const bool pending = Rebuild_Ptr != nullptr;
++        pthread_mutex_unlock(&rebuild_ptr_mutex_lock);
++        if (!pending)
++        {
++            return;
++        }
++        // The rebuild worker polls on this interval. Yielding here lets a
++        // queued job acquire the mutex; the next lock then blocks through
++        // the active rebuild and rechecks its state.
++        usleep(100);
++    }
++}
++
++template <typename PointType>
+ void *KD_TREE<PointType>::multi_thread_ptr(void *arg)
+ {
+     KD_TREE *handle = (KD_TREE *)arg;
