@@ -10,6 +10,8 @@ are what actually exercises the IEKF update path.)
 
 from __future__ import annotations
 
+from collections import deque
+
 import numpy as np
 
 GRAVITY = 9.81
@@ -43,7 +45,7 @@ def box_room_sweep(position: np.ndarray, n_azimuth: int = 360, n_rings: int = 16
 IMU_LEAD_SECONDS = 0.1
 
 
-def run_stationary_session(odom, duration: float = 3.0, imu_hz: float = 200.0,
+def run_stationary_session(odom, duration: float = 1.5, imu_hz: float = 200.0,
                            lidar_hz: float = 10.0, with_imu: bool = True) -> dict:
     """Feed a stationary box-room scene through `odom` (a resple.RespleOdometry) and finish().
 
@@ -55,16 +57,23 @@ def run_stationary_session(odom, duration: float = 3.0, imu_hz: float = 200.0,
     assert imu_hz * IMU_LEAD_SECONDS >= 15, "first sweep would race gravity initialization"
     next_lidar_t = 0.0
     sweep_index = 0
+    unresolved = deque()
     n_imu = int(duration * imu_hz) + 50
     for i in range(n_imu):
         stamp = i / imu_hz
         if with_imu:
             odom.push_imu(stamp, [0.0, 0.0, GRAVITY], [0.0, 0.0, 0.0])
+            if i == 14:
+                assert odom.synchronize(), "initialization IMU prefix did not synchronize"
         while next_lidar_t <= stamp - IMU_LEAD_SECONDS and next_lidar_t < duration:
-            points, relative_times = box_room_sweep(np.zeros(3), seed=sweep_index)
-            odom.push_lidar(next_lidar_t, points, relative_times)
+            points, relative_times = box_room_sweep(
+                np.zeros(3), n_azimuth=120, n_rings=8, seed=sweep_index,
+            )
+            unresolved.append(odom.push_lidar(next_lidar_t, points, relative_times))
             sweep_index += 1
             next_lidar_t += 1.0 / lidar_hz
+            while unresolved and odom.synchronize(unresolved[0]):
+                unresolved.popleft()
     return odom.finish()
 
 
@@ -80,7 +89,7 @@ def second_lidar_extrinsics() -> tuple[tuple[float, float, float, float], list[f
     return (1.0, 0.0, 0.0, 0.0), list(-SECOND_LIDAR_OFFSET)
 
 
-def run_stationary_multi_lidar_session(odom, duration: float = 3.0, imu_hz: float = 200.0,
+def run_stationary_multi_lidar_session(odom, duration: float = 1.5, imu_hz: float = 200.0,
                                        lidar_hz: float = 10.0) -> dict:
     """Feed the same stationary box room through two co-mounted LiDARs.
 
@@ -98,17 +107,26 @@ def run_stationary_multi_lidar_session(odom, duration: float = 3.0, imu_hz: floa
     # (name, sensor position in the body frame, next release time)
     streams = [[first, np.zeros(3), 0.0], [second, SECOND_LIDAR_OFFSET, 0.5 / lidar_hz]]
     sweep_index = 0
+    unresolved = deque()
     for i in range(int(duration * imu_hz) + 50):
         stamp = i / imu_hz
         odom.push_imu(stamp, [0.0, 0.0, GRAVITY], [0.0, 0.0, 0.0])
+        if i == 14:
+            assert odom.synchronize(), "initialization IMU prefix did not synchronize"
         while True:
             stream = min(streams, key=lambda entry: entry[2])
             name, position, next_t = stream
             if next_t > stamp - IMU_LEAD_SECONDS or next_t >= duration:
                 break
-            world_points, relative_times = box_room_sweep(position, seed=sweep_index)
-            odom.push_lidar(next_t, world_points - position.astype(np.float32),
-                            relative_times, lidar=name)
+            world_points, relative_times = box_room_sweep(
+                position, n_azimuth=120, n_rings=8, seed=sweep_index,
+            )
+            unresolved.append(odom.push_lidar(
+                next_t, world_points - position.astype(np.float32),
+                relative_times, lidar=name,
+            ))
             sweep_index += 1
             stream[2] = next_t + 1.0 / lidar_hz
+            while unresolved and odom.synchronize(unresolved[0]):
+                unresolved.popleft()
     return odom.finish()

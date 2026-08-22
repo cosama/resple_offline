@@ -51,7 +51,12 @@ structurally replaces the ROS graph:
   them and packet identity, so omission means "already driver-valid" and
   cannot reconstruct filtering discarded during preparation.
   Everything downstream -- `processData`'s PointData construction, IEKF
-  update, and map maintenance -- remains upstream logic.
+  update, and map maintenance -- remains upstream logic. Bridge-only ticket
+  sidecars run in lockstep with the raw-cloud, downsampled-point, and estimator
+  batch queues; they do not alter `PointData` or any estimator API. A sweep
+  ticket completes only after every surviving point has completed its estimator
+  batch (or initial-map build), or upstream has definitively discarded it as
+  older than the active spline window.
 - **Results**: `create_publisher<T>()` returns a `Publisher<T>` whose
   `publish()` forwards to a bridge-registered capture callback
   (`Publisher<T>::capture_slot()`). This is how the bridge observes init
@@ -64,6 +69,22 @@ structurally replaces the ROS graph:
   `#include`s the staged `src/RESPLE.cpp` directly (one translation unit,
   the same technique `frameworks/voxel_slam` uses) rather than linking it as
   a second object file, which would ODR-violate on those globals.
+- **Explicit synchronization**: each worker pass holds
+  `bridge_processing_mutex` and publishes the sensor-submission epoch only
+  after raw input is drained and initialization/measurement collection is
+  blocked on more input. After publication the worker releases the pass mutex;
+  if `synchronize()` has requested that epoch, it waits for the host to acquire
+  and release the boundary before starting another pass. Without an explicit
+  request this hook returns immediately. This handoff is required because the
+  worker's short repeated passes can otherwise continually reacquire the mutex
+  ahead of the awakened host, especially while upstream sleeps inside
+  `collectMeasurements()`. `synchronize()` snapshots an epoch, waits for its
+  stable-blocked publication, excludes the worker with the same mutex, and
+  only then waits for a pending ikd-tree rebuild. `finish()` closes and joins
+  the worker before placing the same tree barrier. The barrier is intentionally
+  absent from ordinary estimator batches: deterministic stepwise replay calls
+  `synchronize()` between LiDAR submissions, while clients that run freely
+  retain upstream's background-rebuild scheduling.
 
 This avoids a hand-authored split of ROS I/O from the algorithm body.
 
@@ -116,10 +137,17 @@ enumerates the entire local delta -- added calls and their rationale -- in the
 file a reader is actually compiling. The patch headers are only an index; the
 reasoning has a single home, at the sites, so the two cannot drift apart.
 
+Hunks are generated with `diff -U3` against the pinned source and never
+hand-trimmed, and CMake applies them with `-F0`. Fuzz is what lets `patch`
+place a hunk whose context no longer matches, which is precisely the silent
+drift the staged copy exists to catch -- and because `patch` charges *missing*
+context against the same fuzz budget, a hunk with fewer than three context
+lines per side can only ever apply by fuzzing.
+
 | Patch | Upstream file(s) | What |
 |---|---|---|
-| `01-resple-node.patch` | `src/RESPLE.cpp` | Six grouped changes, enumerated in the patch header: (1) widens `private:` to `public:` so `cpp/bindings.cpp` can inject sensor data and read spline state; (2) gives `processData()`'s `while (true)` loop a state-based exit -- the worker stops after the first pass that *began* with input closed and moved nothing, the flag sampled at the top of the pass so a push landing mid-pass cannot be dropped; (3) pops the raw queues under their own mutex and notifies the bridge on each dequeue, which is what releases producer backpressure; (4) calls the ikd-tree quiescence barrier at each measurement-batch boundary; (5) two `initialization()` determinism fixes -- the initial map is built only from the *complete* fixed 100 ms window, and `propRCP(start_t_ns)` moves below both retry gates so it runs exactly once (on a spline that already covers `t` its whole effect is `cov_rcp += cov_sys`, so one call per retry pass scaled the initial covariance with a scheduling-dependent pass count); (6) fails immediately, with the relevant density settings, when a complete window holds fewer than the required 100 downsampled points. |
-| `02-ikd-tree.patch` | `include/ikd-Tree/ikd_Tree.{h,cpp}` | Ports DALI-SLAM's compatible ikd-tree rebuild quiescence barrier and initializes the rebuild thread handle, so correspondence searches never run against an in-flight background rebuild. Declaration and definition are one change and neither compiles alone, so both files share a patch. |
+| `01-resple-node.patch` | `src/RESPLE.cpp` | Seven grouped changes, enumerated in the patch header: (1) widens `private:` to `public:` so `cpp/bindings.cpp` can inject sensor data and read spline state; (2) gives `processData()`'s `while (true)` loop a state-based exit and stable-blocked epoch publication, with each pass guarded by `bridge_processing_mutex`; (3) pops raw queues under their own mutex, notifies producer backpressure, and carries global sweep tickets through lockstep raw/point/batch sidecars (checked with `resple_bridge::check_invariant`, not `assert`: the shipped build is Release, so `assert` would be compiled out exactly where a desynced sidecar becomes undefined behavior), acknowledging initialization points only after `ikdtree.Build` and measurement points only after all work in their estimator batch; (4) three `initialization()` correctness fixes -- LIO waits for the fixed 15-sample gravity prefix, the initial map is built only from the *complete* fixed 100 ms window, and `propRCP(start_t_ns)` moves below both retry gates so it runs exactly once (on a spline that already covers `t` its whole effect is `cov_rcp += cov_sys`, so one call per retry pass scaled the initial covariance with a scheduling-dependent pass count); (5) fails immediately, with the relevant density settings, when a complete window holds fewer than the required 100 downsampled points; (6) initializes upstream's spline member to nullptr so a session that never reaches `initFilter` can finish and report no finalized pose safely; (7) guards upstream's unconditional `pt_meas.back()` in `processData()` -- `collectMeasurements()` returns true whenever it consumed anything, including a pass that discarded every point it popped as older than the active spline window, leaving `pt_meas` empty and the read out of bounds. |
+| `02-ikd-tree.patch` | `include/ikd-Tree/ikd_Tree.{h,cpp}` | Exposes the compatible ikd-tree rebuild quiescence barrier used only at explicit `synchronize()`/`finish()` boundaries and initializes the rebuild thread handle. Declaration and definition are one change and neither compiles alone, so both files share a patch. |
 
 ## Known limitations / open validation
 
@@ -166,27 +194,32 @@ reasoning has a single home, at the sites, so the two cannot drift apart.
   fields should not be compared directly against other frameworks' without
   accounting for RESPLE's much higher native pose rate (a rate-matched
   path-length metric in the manifest would be a reasonable future addition,
-  not done here). Two real bugs surfaced and were fixed by this run
-  (not by the earlier synthetic-only pass): a `push_lidar` `ValueError` for
-  the dataset's final sweep (no trailing IMU past it -- expected per
-  ARCHITECTURE.md, `run_resple.py` now treats it as end-of-input rather than
-  a fatal error) that was, before the second fix, crashing the whole
-  process with `terminate called without an active exception` because the
-  still-running native worker thread was left for the interpreter to tear
-  down mid-shutdown instead of being drained via `finish()` in a `finally`.
+  not done here). The current explicit-synchronization API supersedes the
+  original acceptance-time IMU check used for that run: a final sweep is
+  accepted and ticketed, `synchronize(ticket)` returns false when trailing IMU
+  or LiDAR lookahead is absent, and `finish()` reports the incomplete suffix.
+  The runner always closes the native worker in `finally`, including on an
+  unrelated replay error.
   Still run the ARCHITECTURE.md validation ladder's bounded-real-data-parity
   step against a real ROS2 build (upstream's own `Dockerfile`) before
   trusting this for benchmark numbers.
-- **Determinism**: three known scheduler-dependent inputs are closed off.
+- **Determinism**: three known scheduler-dependent inputs are closed off for
+  deterministic stepwise replay, which places `synchronize()` boundaries
+  between LiDAR submissions.
   (1) Completion is state-based -- input closure sampled at pass start, not a
   queue-depth observation plus grace sleep -- and producer backpressure waits
-  on worker progress rather than a wall clock. (2) The ikd-tree rebuild
-  barrier removes the correspondence/rebuild scheduling race (scope caveat in
-  the patch header). (3) `push_lidar` refuses a first sweep preceded by fewer
-  than 15 IMU samples: `initialization()` averages `std::min(15,
-  imu_buff.size())` samples for gravity, and below 15 that count depends on
-  how far the producer ran before the worker reached init, which would make
-  the initial orientation -- and the whole trajectory -- scheduler-dependent.
+  on worker progress rather than a wall clock. Ticket completion additionally
+  distinguishes raw dequeue from full estimator/discard completion. (2) The
+  explicit synchronization boundary drains any pending ikd-tree rebuild before
+  the next submitted sweep can enter correspondence search. Free-running use
+  without those boundaries intentionally retains upstream scheduling (scope
+  caveat in the patch header). (3) In LIO mode `initialization()` waits until
+  `imu_buff` contains its fixed 15-sample gravity prefix. `push_lidar` may
+  accept and queue a sweep before then; `synchronize(ticket)` reaches a stable
+  incomplete boundary and returns false rather than initializing from zero or
+  a scheduler-dependent short prefix. Once the missing IMU is submitted,
+  initialization averages exactly 15 samples, making the initial orientation
+  independent of how far the producer ran before the worker reached it.
   Batch composition itself is *not* timing-dependent: `collectMeasurements()`
   cuts on a spline-derived time window, and the OpenMP loops in `Estimator.h`
   are element-wise writes with serial assembly, so no FP-reduction ordering is
@@ -209,7 +242,9 @@ reasoning has a single home, at the sites, so the two cannot drift apart.
 2. Update `upstream/RESPLE` to the new revision.
 3. Re-run CMake configure: a patch that fails to apply means upstream has
    drifted under it -- resolve as an upstream API/behavior change, not a
-   blind re-generation.
+   blind re-generation. Regenerate the patch by staging the pinned source,
+   editing it, and running `diff -U3`; the configure step applies with `-F0`,
+   so hand-trimmed context will be rejected outright.
 4. Rebuild, re-run `core/tests/synthetic.py` and `tests/test_run_resple.py`.
 5. Re-run the parity/determinism checks above before trusting output.
 6. Update the pin table and this file.

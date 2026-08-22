@@ -9,21 +9,36 @@ This header is only an index; the reasoning has one home, at the sites.
 
 1. Visibility. `private:` -> `public:` so cpp/bindings.cpp can inject sensor
    data into RESPLE's own buffers and read spline state. No behavior change.
-2. Finish condition. processData()'s `while (true)` gets a state-based exit:
-   the first pass that both began with input closed and moved nothing.
-3. Queue discipline. Pop under the queues' own mutex; notify the bridge on
-   every dequeue, which is what releases producer backpressure.
-4. ikd-tree quiescence at each measurement-batch boundary (barrier added by
-   02-ikd-tree.patch).
-5. Deterministic initialization(): the initial map is built only from the
-   *complete* fixed 100 ms window, and propRCP(start_t_ns) moves below both
-   retry gates so it runs exactly once. Both were producer/worker races that
-   several LiDARs make easy to hit, because they make the number of
-   initialization passes scheduling-dependent. Single-LiDAR replay never
-   entered the retry path, so its trajectory is bit-identical across this
-   change.
-6. An actionable failure when a complete 100 ms window holds fewer than the
+2. Finish/synchronization condition. processData()'s `while (true)` gets a
+   state-based exit and publishes stable-blocked submission epochs while a
+   bridge-owned mutex makes each worker pass an explicit synchronization unit.
+   After publication the worker releases that mutex and honors an explicit
+   handoff request before it may start another pass, preventing lock starvation.
+3. Queue discipline and tickets. Pop under the queues' own mutex; notify the
+   bridge on every dequeue, and carry a sweep ticket through raw, downsampled,
+   discarded, initialization, and estimator-batch queues using lockstep
+   sidecars, checked with resple_bridge::check_invariant rather than assert
+   (the shipped build is Release, so assert would compile the checks out
+   exactly where a desynced sidecar becomes undefined behavior). Upstream
+   PointData and estimator APIs stay unchanged.
+4. Deterministic initialization(): LIO waits for the fixed 15-sample gravity
+   prefix, the initial map is built only from the *complete* fixed 100 ms
+   window, and propRCP(start_t_ns) moves below both retry gates so it runs
+   exactly once. These prevent initialization state from depending on how far
+   the producer ran before the worker. Single-LiDAR replay with sufficient IMU
+   lead never entered the retry path, so its trajectory is bit-identical.
+5. An actionable failure when a complete 100 ms window holds fewer than the
    required 100 downsampled points; more input cannot change a closed window.
+6. Safe pre-initialization lifecycle. `spline` starts as nullptr rather than an
+   indeterminate pointer, so a starved session can finish and report no pose
+   instead of dereferencing garbage before initFilter assigns the real spline.
+7. An upstream out-of-bounds read: processData() takes pt_meas.back() on every
+   true return from collectMeasurements(), which also covers a pass that
+   discarded every point it popped and left pt_meas empty.
+
+Hunks are generated with `diff -U3`, never hand-trimmed: patch(1) charges
+missing context against its fuzz budget, so a hunk with fewer than three
+context lines per side cannot apply under the `-F0` the build requires.
 
 --- src/RESPLE.cpp
 +++ src/RESPLE.cpp
@@ -33,12 +48,18 @@ This header is only an index; the reasoning has one home, at the sites.
  #include <std_msgs/msg/int64.hpp>
  #include <std_msgs/msg/bool.hpp>
  #include <sensor_msgs/msg/imu.hpp>
-@@ -86,16 +87,32 @@
+@@ -86,35 +87,80 @@
          rclcpp::Rate rate(20);
          int64_t max_spl_knots = 0;
          int64_t t_last_map_upd = 0;
 -        while (true) {      
 +        while (true) {
++            // resple_bridge: one pass is the unit observed by synchronize().
++            // Producers may continue submitting while it runs; the epoch is
++            // sampled before any input queue is scanned.
++            std::unique_lock<std::mutex> processing_lock(bridge_processing_mutex);
++            const std::uint64_t pass_submission_epoch =
++                resple_bridge::current_submission_epoch();
 +            // Sampled before this pass scans any buffer -- see offline_bridge.hpp.
 +            const bool closed_at_pass_start = resple_bridge::input_closed();
 +            bool made_progress = false;
@@ -59,23 +80,46 @@ This header is only an index; the reasoning has one home, at the sites.
 -                    lidar_data.t_buff.pop_front();
 -                    lidar_data.mtx_pc.unlock();
 +                    int64_t time_begin;
++                    std::uint64_t raw_ticket;
 +                    {
 +                        std::lock_guard<std::mutex> lock(lidar_data.mtx_pc);
 +                        if (lidar_data.t_buff.empty()) {
 +                            break;
 +                        }
++                        resple_bridge::check_invariant(
++                            lidar_data.pc_buff.size() == lidar_data.t_buff.size(),
++                            "raw sweep queue desynced from its timestamp sidecar");
++                        resple_bridge::check_invariant(
++                            lidar_data.pc_buff.size() == lidar_data.raw_ticket_buff.size(),
++                            "raw sweep queue desynced from its ticket sidecar");
 +                        pc_frame->points = std::move(lidar_data.pc_buff.front());
 +                        lidar_data.pc_buff.pop_front();
 +                        time_begin = lidar_data.t_buff.front();
 +                        lidar_data.t_buff.pop_front();
++                        raw_ticket = lidar_data.raw_ticket_buff.front();
++                        lidar_data.raw_ticket_buff.pop_front();
 +                    }
 +                    made_progress = true;
 +                    resple_bridge::note_progress();
                      std::vector<int> indices;
                      pcl::removeNaNFromPointCloud(*pc_frame, *pc_frame, indices);
                      pc_last_ds->clear();
-@@ -110,11 +127,18 @@
+ 
+                     ds_filter_body.setInputCloud(pc_frame);
+                     ds_filter_body.filter(*pc_last_ds);
++                    // resple_bridge: zero-point sweeps complete here; otherwise
++                    // each downsampled point carries the sweep ticket onward.
++                    resple_bridge::note_raw_ingested(raw_ticket, pc_last_ds->points.size());
+                     sort(pc_last_ds->points.begin(), pc_last_ds->points.end(), &CommonUtils::time_list);
+                     const LidarConfig& lidar = lidars.at(lidar_name);
+                     for (size_t i = 0; i < pc_last_ds->points.size(); i++) {
+                         PointData pt(pc_last_ds->points[i], time_begin, lidar.q_bl, lidar.t_bl, lidar.w_pt);
+                         lidar_data.pt_buff.push_back(pt);
++                        lidar_data.pt_ticket_buff.push_back(raw_ticket);
                      }
++                    resple_bridge::check_invariant(
++                        lidar_data.pt_buff.size() == lidar_data.pt_ticket_buff.size(),
++                        "point queue desynced from its ticket sidecar after sweep fan-out");
                  }
              }            
 -            if (!if_lidar_only && !imu_int_buff.empty()) {
@@ -98,42 +142,95 @@ This header is only an index; the reasoning has one home, at the sites.
                  for (size_t i = 0; i < imu_buff_msg.size(); i++) {
                      const auto imu_msg = imu_buff_msg[i];
                      int64_t t_ns = rclcpp::Time(imu_msg->header.stamp).nanoseconds();
-@@ -126,11 +150,25 @@
+@@ -126,10 +172,51 @@
                  }
              }
              if(!initialization()) {
++                // resple_bridge: initialization() also returns false on the pass
++                // that finishes both stages. Such a pass can make estimator
++                // progress without new input, so publish a blocked epoch only
++                // when initialization is genuinely awaiting input.
++                const bool init_stable_blocked = !(if_init_filter && if_init_map);
++                if (init_stable_blocked) {
++                    resple_bridge::note_stable_blocked(pass_submission_epoch);
++                }
 +                // resple_bridge: the offline finish condition. Upstream's loop is
 +                // `while (true)` -- a real ROS node is killed, never joined, so it
 +                // has no exit at all. Stop after the first pass that both *began*
 +                // with input closed and moved nothing. The flag is the one sampled
 +                // at the top of this pass, never re-read here: re-reading would
 +                // race a sweep pushed after this pass scanned the buffers.
++                //
++                // This cannot cut initialization short. Raw input is drained
++                // into pt_buff/imu_buff above, in this same pass, before
++                // initialization() is called -- so the pass on which
++                // initialization can first succeed is necessarily one that
++                // moved data, and made_progress is true there. Every reason
++                // initialization() returns false early is "needs more input".
 +                if (closed_at_pass_start && !made_progress) {
 +                    break;
++                }
++                processing_lock.unlock();
++                if (init_stable_blocked) {
++                    // resple_bridge: hand the released pass mutex to an explicit
++                    // synchronize() waiter before this worker can reacquire it.
++                    resple_bridge::wait_for_synchronization_release(pass_submission_epoch);
 +                }
                  rate.sleep();
                  continue;
              }
              while (collectMeasurements()) {
 +                made_progress = true;  // resple_bridge: a formed batch is progress
++                // resple_bridge: upstream reads pt_meas.back() unconditionally,
++                // but collectMeasurements() returns true whenever it consumed
++                // anything -- including a pass whose every popped point was
++                // dropped as older than the active spline window, which leaves
++                // pt_meas empty and the read undefined. Those points are already
++                // acknowledged as discarded on their way out, so there is
++                // nothing to update from: take the next batch.
++                if (pt_meas.empty()) {
++                    continue;
++                }
                  int64_t max_time_ns = pt_meas.back().time_ns;
-+                // resple_bridge: quiesce the ikd-tree before this batch's
-+                // correspondence searches (barrier added by 02-ikd-tree.patch),
-+                // so a search never races a background subtree rebuild.
-+                ikdtree.wait_for_pending_rebuild();
                  if (if_lidar_only) {
                      estimator_lo.propRCP(max_time_ns);
-                     estimator_lo.updateIEKFLiDAR(pt_meas, &ikdtree, param.nn_thresh, param.coeff_cov);  
-@@ -174,12 +212,22 @@
+@@ -154,6 +241,9 @@
+                     pc_world.points.push_back(pt_data.pt_w);
+                     accum_nearest_points.push_back(pt_data.nearest_points);
+                 }
++                resple_bridge::check_invariant(
++                    pt_meas.size() == pt_meas_ticket_buff.size(),
++                    "measurement batch desynced from its ticket sidecar before acknowledgement");
+                 pt_meas.clear();
+                 if (spline->numKnots() > max_spl_knots) {
+                     estimate_msgs::msg::Spline spline_msg;
+@@ -173,13 +263,39 @@
+                     accum_nearest_points.clear();
                      t_last_map_upd = max_time_ns;
                  }
++                // resple_bridge: acknowledge only after every operation in this
++                // measurement batch, including any map update/publication, has
++                // succeeded. Keeping the ticket sidecar does not change the
++                // upstream pt_meas lifetime or force the conditional map path.
++                for (const std::uint64_t ticket : pt_meas_ticket_buff) {
++                    resple_bridge::note_point_processed(ticket);
++                }
++                pt_meas_ticket_buff.clear();
              }                      
++            // resple_bridge: raw inputs were drained and collectMeasurements()
++            // cannot form another batch. Publish the epoch sampled before this
++            // pass scanned input while still holding bridge_processing_mutex.
++            resple_bridge::note_stable_blocked(pass_submission_epoch);
 +            // resple_bridge: same finish condition as above, for a pass that got
 +            // as far as the estimator. Both exits are needed: initialization()
 +            // returning false skips the loop entirely.
 +            if (closed_at_pass_start && !made_progress) {
 +                break;
 +            }
++            processing_lock.unlock();
++            // resple_bridge: an absent synchronization request returns
++            // immediately; a matching one owns the boundary before next pass.
++            resple_bridge::wait_for_synchronization_release(pass_submission_epoch);
          }
      }    
  
@@ -148,7 +245,49 @@ This header is only an index; the reasoning has one home, at the sites.
  
      std::string node_name = "RESPLE";
      rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_ouster;
-@@ -655,13 +703,11 @@
+@@ -214,11 +330,17 @@
+     struct LidarData {
+         Eigen::aligned_deque<Eigen::aligned_vector<pcl::PointXYZINormal>> pc_buff;
+         std::deque<int64_t> t_buff;
++        std::deque<std::uint64_t> raw_ticket_buff;  // resple_bridge: raw sidecar
+         std::mutex mtx_pc;
+         Eigen::aligned_deque<PointData> pt_buff;
++        std::deque<std::uint64_t> pt_ticket_buff;   // resple_bridge: point sidecar
+     };
+     std::map<std::string, LidarData> lidars_data;    
+     Eigen::aligned_deque<PointData> pt_meas;    
++    std::deque<std::uint64_t> pt_meas_ticket_buff;  // resple_bridge: batch sidecar
++    // Held for one complete worker pass and by synchronize() while it places
++    // the explicit ikd-tree quiescence barrier.
++    std::mutex bridge_processing_mutex;
+ 
+     bool if_lidar_only;
+     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu;
+@@ -234,7 +356,7 @@
+     bool if_init_filter = false;
+     Estimator<24> estimator_lo;
+     Estimator<30> estimator_lio;
+-    SplineState* spline;
++    SplineState* spline = nullptr;  // resple_bridge: safe before initFilter
+     double cov_P0 = 0.02;
+     double cov_RCP_pos_old = 0.02;
+     double cov_RCP_ort_old = 0.02;
+@@ -623,6 +745,14 @@
+             start_t_ns = std::min(start_t_ns, std::max(lidar_data.pt_buff.front().time_ns, int64_t(0)));
+         }        
+         if (!if_init_filter) {
++            // resple_bridge: gravity is defined by a fixed 15-sample prefix.
++            // Accepting a shorter prefix makes orientation depend on producer/
++            // worker scheduling, and zero samples divides by zero below. Wait
++            // for more IMU instead; synchronize(ticket) then reports the stable
++            // incomplete boundary without rejecting the already queued LiDAR.
++            if (!if_lidar_only && imu_buff.size() < 15) {
++                return false;
++            }
+             Eigen::Quaterniond q_WI = Eigen::Quaterniond::Identity();   
+             if (!if_lidar_only) {
+                 Eigen::Vector3d gravity_sum(0, 0, 0);
+@@ -655,13 +785,11 @@
              if(ikdtree.Root_Node == nullptr) {
                  ikdtree.set_downsample_param(ds_lm_voxel);
              }
@@ -165,7 +304,7 @@ This header is only an index; the reasoning has one home, at the sites.
                  for (size_t i = 0; i < lidar_data.pt_buff.size(); i++) {
                      if (lidar_data.pt_buff[i].time_ns < start_t_ns + 1e8) {
                          feats_down_size++;
-@@ -671,8 +717,48 @@
+@@ -671,8 +799,48 @@
                  }
              }            
              if(feats_down_size < 100) {
@@ -215,3 +354,74 @@ This header is only an index; the reasoning has one home, at the sites.
              pc_world.clear();
              pc_world.resize(feats_down_size); 
              int world_i = 0;
+@@ -687,12 +855,28 @@
+                     }
+                 }
+             }
++            std::vector<std::uint64_t> init_tickets;
++            init_tickets.reserve(feats_down_size);
+             for (auto& [lidar_name, lidar_data] : lidars_data) {
++                resple_bridge::check_invariant(
++                    lidar_data.pt_buff.size() == lidar_data.pt_ticket_buff.size(),
++                    "point queue desynced from its ticket sidecar entering initial-map pop");
+                 while (!lidar_data.pt_buff.empty() && lidar_data.pt_buff.front().time_ns < start_t_ns + 1e8) {
++                    init_tickets.push_back(lidar_data.pt_ticket_buff.front());
+                     lidar_data.pt_buff.pop_front();
++                    lidar_data.pt_ticket_buff.pop_front();
+                 }
++                resple_bridge::check_invariant(
++                    lidar_data.pt_buff.size() == lidar_data.pt_ticket_buff.size(),
++                    "point queue desynced from its ticket sidecar after initial-map pop");
+             }            
+             ikdtree.Build(pc_world.points); 
++            // resple_bridge: initialization points complete only after the map
++            // build succeeds; acknowledging while popping would expose a false
++            // completed boundary if Build threw or failed.
++            for (const std::uint64_t ticket : init_tickets) {
++                resple_bridge::note_point_processed(ticket);
++            }
+             pc_world.clear();
+             if_init_map = true;
+         }       
+@@ -705,6 +889,9 @@
+         int64_t pt_min_time = std::numeric_limits<int64_t>::max();
+         int64_t pt_max_time = std::numeric_limits<int64_t>::max();            
+         for (const auto& [lidar_name, lidar_data] : lidars_data) {
++            resple_bridge::check_invariant(
++                lidar_data.pt_buff.size() == lidar_data.pt_ticket_buff.size(),
++                "point queue desynced from its ticket sidecar entering measurement collection");
+             if (lidar_data.pt_buff.empty()) {
+                 rate.sleep();
+                 return false;
+@@ -734,15 +921,31 @@
+         }
+         int cnt = 0;
+         for (auto& [lidar_name, lidar_data] : lidars_data) {
++            resple_bridge::check_invariant(
++                lidar_data.pt_buff.size() == lidar_data.pt_ticket_buff.size(),
++                "point queue desynced from its ticket sidecar entering batch pop");
+             while (!lidar_data.pt_buff.empty() && lidar_data.pt_buff.front().time_ns <= max_time_ns &&
+                     cnt < num_points_upd) {
+                 if (spline->numKnots() < 10 || lidar_data.pt_buff.front().time_ns >= spline->maxTimeNs() - dt_ns) {
+                     pt_meas.emplace_back(lidar_data.pt_buff.front());
++                    pt_meas_ticket_buff.push_back(lidar_data.pt_ticket_buff.front());
++                } else {
++                    // resple_bridge: upstream deliberately drops points older
++                    // than its active spline window; they are terminal, not
++                    // residual input waiting for a future estimator batch.
++                    resple_bridge::note_point_processed(lidar_data.pt_ticket_buff.front());
+                 }
+                 lidar_data.pt_buff.pop_front();
++                lidar_data.pt_ticket_buff.pop_front();
+                 cnt++;
+             }
++            resple_bridge::check_invariant(
++                lidar_data.pt_buff.size() == lidar_data.pt_ticket_buff.size(),
++                "point queue desynced from its ticket sidecar after batch pop");
+         }                    
++        resple_bridge::check_invariant(
++            pt_meas.size() == pt_meas_ticket_buff.size(),
++            "measurement batch desynced from its ticket sidecar after collection");
+         if (!if_lidar_only) {
+             while (!imu_buff.empty() && imu_buff.front().time_ns < spline->minTimeNs()) {
+                 imu_buff.pop_front();

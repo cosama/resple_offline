@@ -76,6 +76,92 @@ _LIDAR_ONLY_SCRIPT = textwrap.dedent("""
     print("FINITE", bool(np.isfinite(result["trajectory"]).all()))
 """)
 
+_SYNCHRONIZATION_SCRIPT = textwrap.dedent("""
+    import numpy as np
+    from resple import RespleOdometry, config as cfgmod
+    from tests.synthetic import box_room_sweep
+
+    cfg = cfgmod.resolve({"lidars": [{
+        "name": "lidar0", "lidar_type": "Ouster", "scan_line": 64, "blind": 0.3,
+        "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01,
+    }]})
+    odom = RespleOdometry(cfg)
+    points0, times0 = box_room_sweep(np.zeros(3), seed=0)
+    ticket1 = odom.push_lidar(0.0, points0, times0)
+    print("TICKET", ticket1)
+    print("NO_IMU", odom.synchronize(ticket1))
+    for i in range(15):
+        odom.push_imu(i / 200.0, [0.0, 0.0, 9.81], [0.0, 0.0, 0.0])
+    print("BLOCKED_SNAPSHOT", odom.synchronize())
+    print("NO_LOOKAHEAD", odom.synchronize(ticket1))
+    points1, times1 = box_room_sweep(np.zeros(3), seed=1)
+    print("TICKET2", odom.push_lidar(0.1, points1, times1))
+    print("FIRST_DONE", odom.synchronize(ticket1))
+    result = odom.finish()
+    print("LATEST", result["metrics"]["latest_ticket"])
+    print("INCOMPLETE", result["metrics"]["incomplete_tickets"])
+""")
+
+_INITIALIZATION_BOUNDARY_SCRIPT = textwrap.dedent("""
+    from resple import RespleOdometry, config as cfgmod
+    cfg = cfgmod.resolve({"lidars": [{
+        "name": "lidar0", "lidar_type": "Ouster", "scan_line": 64, "blind": 0.3,
+        "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01,
+    }]})
+    odom = RespleOdometry(cfg)
+    for i in range(15):
+        odom.push_imu(i / 200.0, [0.0, 0.0, 9.81], [0.0, 0.0, 0.0])
+    print("BOUNDARY", odom.synchronize())
+    print("LATEST_POSE", odom.latest_pose())
+    odom.finish()
+""")
+
+_TICKET_HOLE_SCRIPT = textwrap.dedent("""
+    import numpy as np
+    from resple import RespleOdometry, config as cfgmod
+    from tests.synthetic import box_room_sweep
+
+    cfg = cfgmod.resolve({"lidars": [
+        {"name": "front", "lidar_type": "Ouster", "scan_line": 64, "blind": 0.3,
+         "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01},
+        {"name": "side", "lidar_type": "Hesai", "scan_line": 32, "blind": 0.3,
+         "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01},
+    ]})
+    odom = RespleOdometry(cfg)
+    for i in range(15):
+        odom.push_imu(i / 200.0, [0.0, 0.0, 9.81], [0.0, 0.0, 0.0])
+    assert odom.synchronize()
+    points, times = box_room_sweep(np.zeros(3), seed=0)
+    first = odom.push_lidar(0.0, points, times, lidar="front")
+    # This later ticket is fully filtered and finishes raw ingestion, but the
+    # public prefix must retain the hole at ticket 1.
+    empty = odom.push_lidar(
+        0.0, np.asarray([[0.01, 0.0, 0.0]], np.float32),
+        np.asarray([0.0], np.float64), lidar="side",
+    )
+    print("TICKETS", first, empty)
+    print("STARVED", odom.synchronize(empty))
+    print("PREFIX", odom.metrics()["completed_ticket"])
+    result = odom.finish()
+    print("INCOMPLETE", result["metrics"]["incomplete_tickets"])
+""")
+
+_FILTERED_SWEEP_SCRIPT = textwrap.dedent("""
+    import numpy as np
+    from resple import RespleOdometry, config as cfgmod
+    cfg = cfgmod.resolve({"if_lidar_only": True, "lidars": [{
+        "name": "lidar0", "lidar_type": "Ouster", "scan_line": 64, "blind": 1.0,
+        "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01,
+    }]})
+    odom = RespleOdometry(cfg)
+    ticket = odom.push_lidar(
+        0.0, np.asarray([[0.01, 0.0, 0.0]], np.float32), np.asarray([0.0], np.float64)
+    )
+    print("DONE", odom.synchronize(ticket))
+    result = odom.finish()
+    print("INCOMPLETE", result["metrics"]["incomplete_tickets"])
+""")
+
 
 def _run_session() -> str:
     proc = subprocess.run(
@@ -126,6 +212,85 @@ def test_upstream_lidar_only_mode_commits_finite_poses():
     lines = dict(line.split(" ", 1) for line in proc.stdout.splitlines() if " " in line)
     assert int(lines["POSES"]) > 0
     assert lines["FINITE"] == "True"
+
+
+def _run_inline(script: str, timeout: int = 60) -> dict[str, str]:
+    proc = subprocess.run(
+        [sys.executable, "-u", "-c", script], cwd=CORE_DIR,
+        capture_output=True, text=True, timeout=timeout,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return dict(line.split(" ", 1) for line in proc.stdout.splitlines() if " " in line)
+
+
+def test_explicit_synchronization_reports_missing_input_then_completes_prefix():
+    lines = _run_inline(_SYNCHRONIZATION_SCRIPT)
+    assert lines["TICKET"] == "1"
+    assert lines["NO_IMU"] == "False"
+    assert lines["BLOCKED_SNAPSHOT"] == "False"
+    assert lines["NO_LOOKAHEAD"] == "False"
+    assert lines["TICKET2"] == "2"
+    assert lines["FIRST_DONE"] == "True"
+    assert lines["LATEST"] == "2"
+
+
+def test_initialization_only_synchronization_absorbs_imu_before_first_sweep():
+    lines = _run_inline(_INITIALIZATION_BOUNDARY_SCRIPT)
+    assert lines["BOUNDARY"] == "True"
+    assert lines["LATEST_POSE"] == "None"
+
+
+def test_global_completed_watermark_does_not_skip_a_starved_stream_hole():
+    lines = _run_inline(_TICKET_HOLE_SCRIPT)
+    assert lines["TICKETS"] == "1 2"
+    assert lines["STARVED"] == "False"
+    assert lines["PREFIX"] == "0"
+    assert int(lines["INCOMPLETE"]) == 2  # neither is in the completed public prefix
+
+
+def test_fully_filtered_sweep_completes_at_raw_ingestion():
+    lines = _run_inline(_FILTERED_SWEEP_SCRIPT)
+    assert lines["DONE"] == "True"
+    assert lines["INCOMPLETE"] == "0"
+
+
+# `max_pending_sweeps=1` with no synchronize() at all, so nearly every
+# push_lidar parks in the producer backpressure wait and is released only by the
+# worker's next dequeue. That wait is the one place a lost notification hangs
+# the process outright, and nothing else in this suite reaches it.
+_BACKPRESSURE_SCRIPT = textwrap.dedent("""
+    import numpy as np
+    from resple import RespleOdometry, config as cfgmod
+    from tests.synthetic import box_room_sweep, GRAVITY
+
+    cfg = cfgmod.resolve({"max_pending_sweeps": 1, "lidars": [{
+        "name": "lidar0", "lidar_type": "Ouster", "scan_line": 64, "blind": 0.3,
+        "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01,
+    }]})
+    odom = RespleOdometry(cfg)
+    next_t, index = 0.0, 0
+    for i in range(350):
+        stamp = i / 200.0
+        odom.push_imu(stamp, [0.0, 0.0, GRAVITY], [0.0, 0.0, 0.0])
+        while next_t <= stamp - 0.1 and next_t < 1.5:
+            points, relative_times = box_room_sweep(
+                np.zeros(3), n_azimuth=120, n_rings=8, seed=index,
+            )
+            odom.push_lidar(next_t, points, relative_times)
+            index += 1
+            next_t += 0.1
+    result = odom.finish()
+    print("POSES", result["trajectory"].shape[0])
+    print("SWEEPS", result["metrics"]["lidar_sweeps_pushed"])
+    print("RESIDUAL", result["metrics"]["residual_sweeps"])
+""")
+
+
+def test_backpressure_wait_is_released_by_worker_progress():
+    lines = _run_inline(_BACKPRESSURE_SCRIPT, timeout=120)
+    assert int(lines["SWEEPS"]) == 15, "producer did not get through its sweeps"
+    assert int(lines["POSES"]) > 0
+    assert lines["RESIDUAL"] == "0"
 
 
 # Two LiDARs of *different* types: upstream keys `lidars`/`lidars_data` by

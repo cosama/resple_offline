@@ -52,13 +52,59 @@ namespace py = pybind11;
 namespace resple_bridge {
 
 namespace {
+struct TicketState {
+  bool committed = false;
+  bool raw_ingested = false;
+  std::size_t pending_points = 0;
+};
+
+struct SynchronizationState {
+  std::mutex mutex;
+  std::condition_variable condition;
+  std::uint64_t submission_epoch = 0;
+  std::uint64_t stable_blocked_epoch = 0;
+  std::uint64_t next_ticket = 1;
+  std::uint64_t latest_committed_ticket = 0;
+  std::uint64_t completed_prefix = 0;
+  bool worker_finished = false;
+  std::uint64_t request_generation = 0;
+  std::uint64_t completed_request_generation = 0;
+  std::uint64_t requested_epoch = 0;
+  std::map<std::uint64_t, TicketState> tickets;
+};
+
+SynchronizationState& synchronization_state() {
+  static SynchronizationState value;
+  return value;
+}
+
+void advance_completed_prefix(SynchronizationState& state) {
+  while (true) {
+    const auto found = state.tickets.find(state.completed_prefix + 1);
+    if (found == state.tickets.end() || !found->second.committed ||
+        !found->second.raw_ingested || found->second.pending_points != 0)
+      return;
+    ++state.completed_prefix;
+    // Nothing looks a ticket up once it is inside the completed prefix: it is
+    // committed, ingested, and every point it produced is acknowledged. Drop
+    // it so the map tracks the incomplete suffix rather than the whole run.
+    state.tickets.erase(found);
+  }
+}
+
 std::atomic<bool>& input_closed_flag() {
   static std::atomic<bool> flag{false};
   return flag;
 }
-// Monotonic counter bumped by every note_progress(). The backpressure wait
-// compares against a snapshot rather than a bare flag, so a notification that
-// lands between "read the snapshot" and "start waiting" cannot be missed.
+// Monotonic counter bumped by every note_progress(). Two things are needed to
+// make a notification unmissable, and the snapshot alone is only one of them:
+// comparing against a snapshot rather than a bare flag covers the window
+// between reading the counter and taking progress_mutex(), while bumping the
+// counter *while holding* progress_mutex() (see note_progress) covers the
+// window between the waiter's predicate returning false and the waiter
+// enqueuing on the condition variable. An atomic counter does not close that
+// second window: a notify issued inside it reaches nobody, and the producer
+// then parks forever on a worker that has already gone idle.
 std::atomic<std::uint64_t>& progress_epoch() {
   static std::atomic<std::uint64_t> value{0};
   return value;
@@ -75,9 +121,26 @@ std::condition_variable& progress_condition() {
 
 // --- offline_bridge.hpp surface ---------------------------------------------
 
+void check_invariant(bool condition, const char* message) {
+  if (!condition)
+    throw std::logic_error(std::string("RESPLE bridge invariant violated: ") + message);
+}
+
 void reset_session_state() noexcept {
   input_closed_flag().store(false, std::memory_order_release);
   progress_epoch().store(0, std::memory_order_release);
+  auto& state = synchronization_state();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  state.submission_epoch = 0;
+  state.stable_blocked_epoch = 0;
+  state.next_ticket = 1;
+  state.latest_committed_ticket = 0;
+  state.completed_prefix = 0;
+  state.worker_finished = false;
+  state.request_generation = 0;
+  state.completed_request_generation = 0;
+  state.requested_epoch = 0;
+  state.tickets.clear();
 }
 
 bool input_closed() noexcept {
@@ -85,8 +148,189 @@ bool input_closed() noexcept {
 }
 
 void note_progress() noexcept {
-  progress_epoch().fetch_add(1, std::memory_order_release);
+  {
+    // Under the mutex, not merely atomic -- see progress_epoch().
+    std::lock_guard<std::mutex> lock(progress_mutex());
+    progress_epoch().fetch_add(1, std::memory_order_release);
+  }
   progress_condition().notify_all();
+}
+
+std::uint64_t current_submission_epoch() noexcept {
+  auto& state = synchronization_state();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  return state.submission_epoch;
+}
+
+void submission_snapshot(std::uint64_t& epoch, std::uint64_t& latest_ticket) noexcept {
+  auto& state = synchronization_state();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  epoch = state.submission_epoch;
+  latest_ticket = state.latest_committed_ticket;
+}
+
+void note_imu_submission() noexcept {
+  auto& state = synchronization_state();
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    ++state.submission_epoch;
+  }
+  state.condition.notify_all();
+}
+
+std::uint64_t reserve_lidar_ticket() noexcept {
+  auto& state = synchronization_state();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  const std::uint64_t ticket = state.next_ticket++;
+  state.tickets.emplace(ticket, TicketState{});
+  return ticket;
+}
+
+void commit_lidar_ticket(std::uint64_t ticket) {
+  auto& state = synchronization_state();
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    auto found = state.tickets.find(ticket);
+    check_invariant(found != state.tickets.end() && !found->second.committed,
+                    "lidar ticket committed twice or never reserved");
+    found->second.committed = true;
+    state.latest_committed_ticket = ticket;
+    ++state.submission_epoch;
+    advance_completed_prefix(state);
+  }
+  state.condition.notify_all();
+}
+
+void release_lidar_ticket(std::uint64_t ticket) noexcept {
+  auto& state = synchronization_state();
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    const auto found = state.tickets.find(ticket);
+    if (found == state.tickets.end() || found->second.committed) return;
+    // Retired in place, not erased: a missing number stalls the contiguous
+    // prefix at ticket-1 exactly as an uncommitted one does. The caller never
+    // received this ticket -- push_lidar threw -- so nothing can wait on it,
+    // and the prefix is free to run straight through. latest_committed_ticket
+    // deliberately does not move, which is why incomplete_tickets saturates.
+    found->second.committed = true;
+    found->second.raw_ingested = true;
+    found->second.pending_points = 0;
+    advance_completed_prefix(state);
+  }
+  state.condition.notify_all();
+}
+
+void note_raw_ingested(std::uint64_t ticket, std::size_t point_count) {
+  auto& state = synchronization_state();
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    auto found = state.tickets.find(ticket);
+    check_invariant(found != state.tickets.end() && !found->second.raw_ingested,
+                    "sweep ticket ingested twice or never reserved");
+    found->second.raw_ingested = true;
+    found->second.pending_points = point_count;
+    advance_completed_prefix(state);
+  }
+  state.condition.notify_all();
+}
+
+void note_point_processed(std::uint64_t ticket) {
+  auto& state = synchronization_state();
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    auto found = state.tickets.find(ticket);
+    check_invariant(found != state.tickets.end() && found->second.raw_ingested &&
+                        found->second.pending_points > 0,
+                    "more points acknowledged than the sweep ticket ingested");
+    --found->second.pending_points;
+    advance_completed_prefix(state);
+  }
+  state.condition.notify_all();
+}
+
+void note_stable_blocked(std::uint64_t submission_epoch) noexcept {
+  auto& state = synchronization_state();
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.stable_blocked_epoch = std::max(state.stable_blocked_epoch, submission_epoch);
+  }
+  state.condition.notify_all();
+}
+
+void wait_for_synchronization_release(std::uint64_t submission_epoch) noexcept {
+  auto& state = synchronization_state();
+  std::unique_lock<std::mutex> lock(state.mutex);
+  if (state.request_generation == state.completed_request_generation ||
+      submission_epoch < state.requested_epoch)
+    return;
+  // Capture the generation represented by this stable pass. A subsequent
+  // Python call may publish the next request before this worker wakes from the
+  // completed request; it must not retroactively keep the old pass parked.
+  const std::uint64_t handed_off_generation = state.request_generation;
+  state.condition.wait(lock, [&] {
+    return state.completed_request_generation >= handed_off_generation ||
+           state.worker_finished;
+  });
+}
+
+void note_worker_finished() noexcept {
+  auto& state = synchronization_state();
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.worker_finished = true;
+  }
+  state.condition.notify_all();
+}
+
+bool wait_for_stable_blocked(std::uint64_t submission_epoch) noexcept {
+  auto& state = synchronization_state();
+  std::unique_lock<std::mutex> lock(state.mutex);
+  state.condition.wait(lock, [&] {
+    return state.stable_blocked_epoch >= submission_epoch || state.worker_finished;
+  });
+  return state.stable_blocked_epoch >= submission_epoch;
+}
+
+std::uint64_t request_synchronization(std::uint64_t submission_epoch) {
+  auto& state = synchronization_state();
+  std::uint64_t generation;
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    check_invariant(state.request_generation == state.completed_request_generation,
+                    "synchronization requested while another request is outstanding");
+    generation = ++state.request_generation;
+    state.requested_epoch = submission_epoch;
+  }
+  state.condition.notify_all();
+  return generation;
+}
+
+void complete_synchronization(std::uint64_t request_generation) {
+  auto& state = synchronization_state();
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    check_invariant(request_generation == state.request_generation,
+                    "synchronization completed out of order");
+    state.completed_request_generation = request_generation;
+  }
+  state.condition.notify_all();
+}
+
+std::uint64_t completed_ticket_prefix() noexcept {
+  auto& state = synchronization_state();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  return state.completed_prefix;
+}
+
+void ticket_snapshot(std::uint64_t& latest, std::uint64_t& completed,
+                     std::size_t& incomplete) noexcept {
+  auto& state = synchronization_state();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  latest = state.latest_committed_ticket;
+  completed = state.completed_prefix;
+  // Saturating: a trailing released reservation (see release_lidar_ticket)
+  // advances the prefix past the last committed ticket.
+  incomplete = latest > completed ? static_cast<std::size_t>(latest - completed) : 0;
 }
 
 void close_input() noexcept {
@@ -173,15 +417,6 @@ double ns_to_seconds(std::int64_t ns) { return static_cast<double>(ns) * 1e-9; }
 std::int64_t seconds_to_ns(double seconds) {
   return static_cast<std::int64_t>(std::llround(seconds * 1e9));
 }
-
-// RESPLE's initialization() derives the gravity direction (and hence the
-// initial orientation, and hence the whole trajectory) from the mean of
-// `std::min(15, imu_buff.size())` samples. Below 15 that count depends on how
-// far the producer thread happened to run before the worker reached init, so
-// the result is scheduler-dependent; at 15 or more the mean is over a fixed
-// prefix of a FIFO and is deterministic. Keep in sync with upstream
-// RESPLE.cpp's `int n_imu = std::min(15, buff_size);`.
-constexpr std::int64_t kInitGravitySamples = 15;
 
 // The window of a spline over which a sampled pose is meaningful.
 //
@@ -290,14 +525,11 @@ struct LidarStream {
 class RespleOdometry {
  public:
   RespleOdometry(const py::dict& params, const std::vector<py::dict>& lidars,
-                int max_pending_sweeps, double min_imu_lead_seconds)
-      : max_pending_sweeps_(max_pending_sweeps),
-        min_imu_lead_seconds_(min_imu_lead_seconds) {
+                int max_pending_sweeps)
+      : max_pending_sweeps_(max_pending_sweeps) {
     if (lidars.empty()) throw py::value_error("at least one lidar is required");
     if (max_pending_sweeps_ < 1)
       throw py::value_error("max_pending_sweeps must be at least 1");
-    if (min_imu_lead_seconds_ < 0.0)
-      throw py::value_error("min_imu_lead_seconds must be >= 0");
 
     // The ikd-tree (RESPLE.cpp file scope) and this bridge's own recorder
     // are process-global. A second session in the same process would
@@ -357,7 +589,6 @@ class RespleOdometry {
   std::int64_t push_imu(double timestamp, const std::vector<double>& acceleration,
                         const std::vector<double>& angular_velocity) {
     throw_if_failed();
-    throw_if_input_closed();
     // In LiDAR-only mode processData() never drains imu_int_buff (upstream's
     // `if (!if_lidar_only && !imu_int_buff.empty())`), so anything pushed here
     // would grow without bound and never reach the estimator. Refuse rather
@@ -373,10 +604,6 @@ class RespleOdometry {
       if (!std::isfinite(acceleration[axis]) || !std::isfinite(angular_velocity[axis]))
         throw py::value_error("IMU measurements must be finite");
     if (!std::isfinite(timestamp)) throw py::value_error("IMU timestamp must be finite");
-    if (timestamp <= last_imu_stamp_)
-      throw py::value_error("imu timestamps must be strictly increasing");
-    last_imu_stamp_ = timestamp;
-
     auto message = std::make_shared<sensor_msgs::msg::Imu>();
     message->header.stamp = rclcpp::Time(seconds_to_ns(timestamp));
     message->linear_acceleration.x = acceleration[0];
@@ -386,13 +613,22 @@ class RespleOdometry {
     message->angular_velocity.y = angular_velocity[1];
     message->angular_velocity.z = angular_velocity[2];
 
-    // Exactly what RESPLE::getImuCallback does with a subscribed message.
+    // Linearize close, validation, enqueue, and the submission epoch. The
+    // worker may consume the message before note_imu_submission(), but a pass
+    // that did so necessarily publishes a snapshot older than this commit;
+    // synchronize() will wait for its next stable-blocked pass.
     {
+      std::lock_guard<std::mutex> input_lock(input_mutex_);
+      throw_if_input_closed();
+      if (timestamp <= last_imu_stamp_)
+        throw py::value_error("imu timestamps must be strictly increasing");
       std::lock_guard<std::mutex> lock(resple_->m_buff);
       resple_->imu_int_buff.push_back(message);
+      last_imu_stamp_ = timestamp;
+      ++imu_pushed_;
+      resple_bridge::note_imu_submission();
     }
 
-    imu_pushed_ += 1;
     auto& state = recorder();
     std::lock_guard<std::mutex> lock(state.mutex);
     state.imu_samples = imu_pushed_;
@@ -411,11 +647,12 @@ class RespleOdometry {
 
     const std::int64_t time_begin_ns =
         seconds_to_ns(timestamp) - (stream.type == "Ouster" ? resple_->time_offset : 0);
-    // Both IMU-coverage checks run before the (blocking) backpressure wait:
-    // neither depends on worker progress, so failing them early keeps a
-    // rejected sweep from parking the producer first.
-    require_imu_coverage(timestamp, time_begin_ns);
-    apply_backpressure(stream);
+    // Missing future IMU/lookahead is a synchronization result, not an input
+    // acceptance rule. Ordinary online pushes retain upstream scheduling.
+    {
+      py::gil_scoped_release release;
+      apply_backpressure(stream);
+    }
     throw_if_failed();
 
     auto p = points.unchecked<2>();
@@ -505,23 +742,88 @@ class RespleOdometry {
     const std::int64_t kept_points = static_cast<std::int64_t>(cloud.size());
     RESPLE::LidarData& buffers = resple_->lidars_data.at(stream.type);
     {
+      std::lock_guard<std::mutex> input_lock(input_mutex_);
+      throw_if_input_closed();
+      // Recheck after the GIL-released backpressure wait so concurrent callers
+      // cannot enqueue a per-stream timestamp inversion.
+      if (timestamp <= stream.last_stamp)
+        throw py::value_error("sweep timestamps must be strictly increasing per lidar");
+      const std::uint64_t ticket = resple_bridge::reserve_lidar_ticket();
+      // The enqueue below can still throw (an allocation, in practice). A
+      // reserved-but-uncommitted ticket blocks the completed prefix forever,
+      // so give it back on the way out and let the original failure surface.
+      struct Reservation {
+        std::uint64_t ticket;
+        bool committed = false;
+        ~Reservation() {
+          if (!committed) resple_bridge::release_lidar_ticket(ticket);
+        }
+      } reservation{ticket};
       std::lock_guard<std::mutex> lock(buffers.mtx_pc);
       buffers.pc_buff.push_back(std::move(cloud));
       buffers.t_buff.push_back(time_begin_ns);
-    }
+      buffers.raw_ticket_buff.push_back(ticket);
+      resple_bridge::check_invariant(buffers.pc_buff.size() == buffers.t_buff.size(),
+                                     "raw sweep queue desynced from its timestamp sidecar");
+      resple_bridge::check_invariant(buffers.pc_buff.size() == buffers.raw_ticket_buff.size(),
+                                     "raw sweep queue desynced from its ticket sidecar");
 
-    stream.last_stamp = timestamp;
-    stream.last_absolute_point_stamp_ns = time_begin_ns + max_kept_offset_ns;
-    stream.sweeps_pushed += 1;
-    stream.points_after_preprocessing += kept_points;
-    // Global across lidars: this is what require_imu_coverage tests for "no
-    // sweep accepted yet", and initialization() runs once for the whole rig.
-    last_lidar_stamp_ = std::max(last_lidar_stamp_, timestamp);
-    auto& state = recorder();
-    std::lock_guard<std::mutex> lock(state.mutex);
-    state.lidar_sweeps_pushed += 1;
-    state.lidar_points_after_preprocessing += kept_points;
-    return state.lidar_sweeps_pushed;
+      stream.last_stamp = timestamp;
+      stream.last_absolute_point_stamp_ns = time_begin_ns + max_kept_offset_ns;
+      stream.sweeps_pushed += 1;
+      stream.points_after_preprocessing += kept_points;
+      last_lidar_stamp_ = std::max(last_lidar_stamp_, timestamp);
+      resple_bridge::commit_lidar_ticket(ticket);
+      reservation.committed = true;
+
+      auto& state = recorder();
+      std::lock_guard<std::mutex> state_lock(state.mutex);
+      state.lidar_sweeps_pushed += 1;
+      state.lidar_points_after_preprocessing += kept_points;
+      return static_cast<std::int64_t>(ticket);
+    }
+  }
+
+  bool synchronize(const py::object& ticket_object = py::none()) {
+    throw_if_failed();
+    std::uint64_t target_epoch = 0, latest_ticket = 0;
+    {
+      std::lock_guard<std::mutex> input_lock(input_mutex_);
+      resple_bridge::submission_snapshot(target_epoch, latest_ticket);
+    }
+    const bool has_ticket = !ticket_object.is_none();
+    const std::uint64_t target_ticket =
+        has_ticket ? py::cast<std::uint64_t>(ticket_object) : latest_ticket;
+    if (has_ticket && (target_ticket == 0 || target_ticket > latest_ticket))
+      throw py::value_error("ticket is not a committed LiDAR submission");
+
+    bool reached_stable = false;
+    std::uint64_t completed_prefix = 0;
+    {
+      py::gil_scoped_release release;
+      // Serialize explicit boundaries without making a second Python caller
+      // hold the GIL while waiting for the first one to return.
+      std::unique_lock<std::mutex> synchronize_lock(synchronize_mutex_);
+      const std::uint64_t request_generation =
+          resple_bridge::request_synchronization(target_epoch);
+      reached_stable = resple_bridge::wait_for_stable_blocked(target_epoch);
+      // A stable-blocked publication precedes this lock. Holding the pass
+      // mutex prevents new estimator/map work while the explicit tree barrier
+      // establishes the deterministic boundary.
+      std::lock_guard<std::mutex> processing_lock(resple_->bridge_processing_mutex);
+      ikdtree.wait_for_pending_rebuild();
+      // Sampled here, while the worker is still excluded and before the
+      // handoff below releases it. Read after complete_synchronization it
+      // would describe whatever the resumed worker had reached by then --
+      // a later instant than the boundary this call exists to establish.
+      completed_prefix = resple_bridge::completed_ticket_prefix();
+      resple_bridge::complete_synchronization(request_generation);
+    }
+    throw_if_failed();
+    if (!reached_stable) return false;
+    // An IMU-only snapshot has no LiDAR ticket and is complete once absorbed.
+    // Otherwise the no-argument form covers every LiDAR committed at entry.
+    return target_ticket == 0 || completed_prefix >= target_ticket;
   }
 
   py::dict finish() {
@@ -545,6 +847,20 @@ class RespleOdometry {
   py::array_t<double> trajectory() {
     throw_if_failed();
     return trajectory_array();
+  }
+
+  py::object latest_pose() {
+    throw_if_failed();
+    auto& state = recorder();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.trajectory.empty()) return py::none();
+    const PoseRecord& pose = state.trajectory.back();
+    py::array_t<double> out(8);
+    auto row = out.mutable_unchecked<1>();
+    row(0) = pose.timestamp;
+    row(1) = pose.x; row(2) = pose.y; row(3) = pose.z;
+    row(4) = pose.qx; row(5) = pose.qy; row(6) = pose.qz; row(7) = pose.qw;
+    return std::move(out);
   }
 
   py::list drain_map_batches() {
@@ -581,6 +897,7 @@ class RespleOdometry {
     result["map_batches_emitted"] = state.map_batches_emitted;
     result["residual_sweeps"] = state.residual_sweeps;
     result["residual_points"] = state.residual_points;
+    add_ticket_counters(result);
     result["estimator_threads"] = NUM_OF_THREAD;
     result["per_lidar"] = per_lidar();
     return result;
@@ -610,11 +927,23 @@ class RespleOdometry {
     result["worker_finished"] = worker_finished_.load();
     result["last_imu_stamp"] = last_imu_stamp_;
     result["last_lidar_stamp"] = last_lidar_stamp_;
+    add_ticket_counters(result);
     result["per_lidar"] = per_lidar();
     return result;
   }
 
  private:
+  // The three ticket counters, read together so a caller never sees a triple
+  // that does not add up (the worker advances between separate reads).
+  static void add_ticket_counters(py::dict& result) {
+    std::uint64_t latest = 0, completed = 0;
+    std::size_t incomplete = 0;
+    resple_bridge::ticket_snapshot(latest, completed, incomplete);
+    result["latest_ticket"] = latest;
+    result["completed_ticket"] = completed;
+    result["incomplete_tickets"] = static_cast<std::int64_t>(incomplete);
+  }
+
   // Producer-side counters, so a rig whose second lidar is silently never fed
   // (which stalls upstream's collectMeasurements: it requires every lidar's
   // pt_buff to be non-empty) is visible rather than merely slow.
@@ -745,6 +1074,7 @@ class RespleOdometry {
         if (!worker_error_) worker_error_ = std::current_exception();
       }
       worker_finished_.store(true, std::memory_order_release);
+      resple_bridge::note_worker_finished();
       // Unblocks a producer parked in apply_backpressure() on a worker that
       // has stopped; it rechecks worker_finished_ and raises.
       resple_bridge::note_progress();
@@ -753,11 +1083,17 @@ class RespleOdometry {
 
   void shutdown() {
     if (!worker_.joinable()) return;
-    resple_bridge::close_input();
+    {
+      std::lock_guard<std::mutex> input_lock(input_mutex_);
+      resple_bridge::close_input();
+    }
     // join() is the state wait: processData returns only after a pass that
     // began with input closed and made no progress. Keep ownership until
     // then; this worker captures `this` and must never be detached.
     worker_.join();
+    // finish is the closing synchronization boundary. No worker can schedule
+    // another rebuild after join, so this covers the final asynchronous job.
+    ikdtree.wait_for_pending_rebuild();
     record_residual_buffers();
   }
 
@@ -807,31 +1143,6 @@ class RespleOdometry {
         throw std::runtime_error("RESPLE worker stopped while applying lidar backpressure");
       epoch = resple_bridge::await_progress(epoch);
     }
-  }
-
-  // The two IMU-coverage preconditions, both producer-side and both checked
-  // before any blocking wait.
-  void require_imu_coverage(double timestamp, std::int64_t time_begin_ns) const {
-    if (resple_->if_lidar_only) return;
-    // "insufficient IMU lead" is load-bearing: scripts/run_resple.py matches on
-    // it to tell a leading-edge IMU gap (skip this sweep) from a real error.
-    if (last_lidar_stamp_ == -std::numeric_limits<double>::infinity() &&
-        imu_pushed_ < kInitGravitySamples)
-      throw py::value_error(
-          "insufficient IMU lead for the first sweep at t=" + std::to_string(timestamp) +
-          ": RESPLE averages the first " + std::to_string(kInitGravitySamples) +
-          " IMU samples to derive gravity, so at least that many must precede the "
-          "first accepted sweep for the result to be reproducible (have " +
-          std::to_string(imu_pushed_) + ").");
-    const double adjusted_timestamp = ns_to_seconds(time_begin_ns);
-    if (last_imu_stamp_ < adjusted_timestamp + min_imu_lead_seconds_)
-      throw py::value_error(
-          "insufficient IMU lead for sweep at t=" + std::to_string(timestamp) +
-          ": have IMU through " + std::to_string(last_imu_stamp_) +
-          ", need through at least " +
-          std::to_string(adjusted_timestamp + min_imu_lead_seconds_) +
-          " (min_imu_lead_seconds=" + std::to_string(min_imu_lead_seconds_) +
-          "). Push more IMU before this sweep.");
   }
 
   void validate_sweep(const LidarStream& stream, double timestamp, const FloatArray& points,
@@ -903,12 +1214,13 @@ class RespleOdometry {
   // One entry per lidar *type*; see LidarStream.
   std::map<std::string, LidarStream> streams_;
   int max_pending_sweeps_;
-  double min_imu_lead_seconds_;
   rclcpp::Node::SharedPtr node_;
   std::unique_ptr<RESPLE> resple_;
   std::thread worker_;
   std::atomic<bool> worker_finished_{false};
   std::mutex worker_mutex_;
+  std::mutex input_mutex_;
+  std::mutex synchronize_mutex_;
   std::exception_ptr worker_error_;
   std::int64_t imu_pushed_ = 0;
   double last_imu_stamp_ = -std::numeric_limits<double>::infinity();
@@ -923,16 +1235,17 @@ PYBIND11_MODULE(_core, module) {
   module.doc() = "Offline host for pinned upstream RESPLE";
 
   py::class_<RespleOdometry>(module, "RespleOdometry")
-      .def(py::init<const py::dict&, const std::vector<py::dict>&, int, double>(),
+      .def(py::init<const py::dict&, const std::vector<py::dict>&, int>(),
            py::arg("parameters"), py::arg("lidars"),
-           py::arg("max_pending_sweeps") = 8,
-           py::arg("min_imu_lead_seconds") = 0.0)
+           py::arg("max_pending_sweeps") = 8)
       .def("push_imu", &RespleOdometry::push_imu, py::arg("timestamp"),
            py::arg("acceleration"), py::arg("angular_velocity"))
       .def("push_lidar", &RespleOdometry::push_lidar, py::arg("timestamp"), py::arg("points"),
            py::arg("relative_times"), py::arg("lines") = py::none(),
            py::arg("tags") = py::none(), py::arg("lidar") = std::string())
+      .def("synchronize", &RespleOdometry::synchronize, py::arg("ticket") = py::none())
       .def("trajectory", &RespleOdometry::trajectory)
+      .def("latest_pose", &RespleOdometry::latest_pose)
       .def("drain_map_batches", &RespleOdometry::drain_map_batches)
       .def("finish", &RespleOdometry::finish)
       .def("metrics", &RespleOdometry::metrics)

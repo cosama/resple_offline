@@ -68,7 +68,6 @@ class RespleConfig:
     lidar_time_offset: float = 0.0
 
     max_pending_sweeps: int = 8
-    min_imu_lead_seconds: float = 0.0
 
     def validate(self) -> list[str]:
         problems: list[str] = []
@@ -111,6 +110,8 @@ class RespleConfig:
             problems.append("num_points_upd must be positive")
         if self.point_filter_num <= 0:
             problems.append("point_filter_num must be positive")
+        if self.max_pending_sweeps < 1:
+            problems.append("max_pending_sweeps must be at least 1")
         if len(self.cov_acc) != 3 or len(self.cov_gyro) != 3:
             problems.append("cov_acc and cov_gyro must have length 3")
         if len(self.cov_ba) != 3 or len(self.cov_bg) != 3:

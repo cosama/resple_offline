@@ -40,7 +40,6 @@ class RespleOdometry:
                 for lidar in cfg.lidars
             ],
             max_pending_sweeps=cfg.max_pending_sweeps,
-            min_imu_lead_seconds=cfg.min_imu_lead_seconds,
         )
 
     @property
@@ -85,10 +84,9 @@ class RespleOdometry:
         has buffered points, so a starved stream stalls the estimator rather
         than degrading to the others.
 
-        Raises ValueError mentioning "insufficient IMU lead" when the IMU
-        pushed so far does not cover this sweep -- including for the first
-        sweep, which additionally needs enough samples for RESPLE's gravity
-        initialization to be reproducible.
+        Returns a globally monotonic ticket shared by every configured LiDAR.
+        Missing IMU or LiDAR lookahead never rejects an ordinary push; use
+        :meth:`synchronize` when a deterministic processed boundary is needed.
         """
         points = np.ascontiguousarray(points, dtype=np.float32)
         relative_times = np.ascontiguousarray(relative_times, dtype=np.float64)
@@ -101,9 +99,25 @@ class RespleOdometry:
             lidar="" if lidar is None else str(lidar),
         )
 
+    def synchronize(self, ticket: int | None = None) -> bool:
+        """Drain currently supplied work to a deterministic boundary.
+
+        With a LiDAR ticket, returns true only when the complete global ticket
+        prefix through it has been processed. False means upstream is stably
+        blocked pending more IMU, LiDAR lookahead, or another configured LiDAR.
+        Without a ticket, synchronizes the current sensor-submission snapshot;
+        this is useful for committing the initialization IMU prefix before the
+        first sweep. The native wait releases the GIL.
+        """
+        return bool(self._native.synchronize(ticket))
+
     def trajectory(self) -> np.ndarray:
         """(N, 8): timestamp, x, y, z, qx, qy, qz, qw."""
         return self._native.trajectory()
+
+    def latest_pose(self) -> np.ndarray | None:
+        """Return the most recent published pose snapshot without blocking."""
+        return self._native.latest_pose()
 
     def drain_map_batches(self) -> list[np.ndarray]:
         return self._native.drain_map_batches()
@@ -120,8 +134,8 @@ class RespleOdometry:
     def finish(self) -> dict:
         """Close input, drain the worker, and return the finalized results.
 
-        There is no timeout: completion is a state condition, so a deadline
-        could only truncate a still-progressing replay.
+        There is no timeout: completion is a state condition. Metrics report
+        any accepted trailing tickets that upstream could not process.
         """
         return self._native.finish()
 

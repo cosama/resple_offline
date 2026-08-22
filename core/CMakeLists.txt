@@ -45,7 +45,12 @@ endif()
 
 foreach(patch_file IN LISTS RESPLE_INTEGRATION_PATCHES)
   execute_process(
-    COMMAND "${PATCH_EXECUTABLE}" --silent --no-backup-if-mismatch -p0 -i "${patch_file}"
+    # -F0: no fuzz. Without it patch(1) will happily place a hunk whose context
+    # no longer matches, which is exactly the silent upstream drift the staged
+    # copy exists to catch. (patch charges missing context against the fuzz
+    # budget too, so every hunk needs three context lines per side -- generate
+    # these patches with `diff -U3`, never by hand-trimming context.)
+    COMMAND "${PATCH_EXECUTABLE}" -F0 --silent --no-backup-if-mismatch -p0 -i "${patch_file}"
     WORKING_DIRECTORY "${RESPLE_STAGE}"
     RESULT_VARIABLE patch_result
     ERROR_VARIABLE patch_error)
