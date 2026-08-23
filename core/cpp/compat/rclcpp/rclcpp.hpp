@@ -1,31 +1,8 @@
 #pragma once
 
-// Minimal replacement for rclcpp/rclcpp.hpp.
-//
-// RESPLE.cpp (staged and patched -- see patches/integration/, three small
-// patches: member visibility, a loop exit condition, and an ikd-tree rebuild
-// barrier) compiles against this shim: rclcpp::Node's constructor/param/pub/
-// sub surface stays structurally the same as real rclcpp, but:
-//
-//   - create_subscription() is a no-op placeholder. This bridge never drives
-//     sensor data through RESPLE's own ROS callbacks -- it injects directly
-//     into RESPLE's per-lidar buffers and IMU queue instead (see
-//     cpp/bindings.cpp), which are exactly the buffers those callbacks would
-//     have filled. That keeps RESPLE's own downsampling/PointData
-//     construction/estimator loop (processData) genuinely unmodified.
-//   - create_publisher() returns a Publisher<T> whose publish() forwards to
-//     a bridge-registered capture callback (Publisher<T>::capture_slot()),
-//     which is how this bridge observes committed poses/spline state and
-//     scan/map updates -- the natural hook points ARCHITECTURE.md calls for,
-//     realized entirely in this compat layer rather than by patching
-//     RESPLE.cpp's publish call sites.
-//   - parameters are a simple typed store the bridge pre-populates
-//     (Node::set_parameter) before RESPLE's constructor runs. was_provided()
-//     lets the bridge tell a bridge-set key from one that fell back to
-//     upstream's declared default.
-//   - Rate::sleep() is a short fixed poll, not real hz-paced sleeping: this
-//     bridge wants processData's wait loop to spin fast, not at wall-clock
-//     20 Hz, so offline replay is not throttled to real time.
+// Minimal rclcpp surface used by the offline bridge. Subscriptions are no-ops,
+// publishers forward to capture callbacks, and Node stores typed parameters.
+// Rate uses a short polling delay so replay is not throttled to wall-clock time.
 
 #include <any>
 #include <atomic>
@@ -33,7 +10,6 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -42,10 +18,6 @@
 #include "rclcpp/time.hpp"
 
 namespace rclcpp {
-
-struct Logger {
-  std::string name;
-};
 
 template <typename MsgT>
 class Subscription {
@@ -63,9 +35,7 @@ class Publisher {
     if (slot) slot(message);
   }
 
-  // One slot per message type: RESPLE.cpp never publishes more than one
-  // topic of a given message type, so this is unambiguous. Reset between
-  // sessions by the bridge (see cpp/bindings.cpp).
+  // RESPLE publishes at most one topic of each captured message type.
   static std::function<void(const MsgT&)>& capture_slot() {
     static std::function<void(const MsgT&)> slot;
     return slot;
@@ -80,19 +50,13 @@ class Node {
     return std::make_shared<Node>(name);
   }
 
-  explicit Node(std::string name) : name_(std::move(name)) {}
+  explicit Node(std::string) {}
 
   // --- Bridge-facing: seed real values before RESPLE's constructor runs ---
   template <typename T>
   void set_parameter(const std::string& key, const T& value) {
     std::lock_guard<std::mutex> lock(mutex_);
     params_[key] = value;
-    provided_.insert(key);
-  }
-
-  bool was_provided(const std::string& key) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return provided_.count(key) != 0;
   }
 
   // --- rclcpp::Node parameter surface RESPLE.cpp/CommonUtils::readParam use ---
@@ -147,13 +111,9 @@ class Node {
     return std::make_shared<Publisher<MsgT>>();
   }
 
-  Logger get_logger() const { return Logger{name_}; }
-
  private:
-  std::string name_;
   mutable std::mutex mutex_;
   std::unordered_map<std::string, std::any> params_;
-  std::set<std::string> provided_;
 };
 
 class Rate {

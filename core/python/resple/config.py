@@ -1,25 +1,14 @@
-"""Typed configuration for the RESPLE offline bridge.
-
-Mirrors dali_slam's config.py shape: one dataclass per requested config, a
-`resolve()` that fills in profile defaults, `validate()` that collects every
-problem instead of failing on the first, and `native_parameters()` that
-returns exactly what bindings.cpp's RespleOdometry constructor consumes --
-so the manifest can report requested vs. effective values (ARCHITECTURE.md
-#7) instead of letting native fall back to a value nobody chose.
-"""
+"""Typed configuration for the RESPLE offline bridge."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
 from typing import Any
 
-# Upstream's own "lidars" parameter is a list, and Estimator/Association fuse
-# every configured LiDAR into one spline (see e.g. upstream's
-# config_heap_testsite_hoenggerberg.yaml: ["livox", "hesai"]). Upstream keys
-# both `lidars` and `lidars_data` by lidar *type*, so a rig may hold at most
-# one entry per type -- validate() reports a collision rather than letting
-# upstream's map emplace silently drop the second one.
-_KNOWN_LIDAR_TYPES = {"Ouster", "Mid70Avia", "HAP360", "AviaResple", "Hesai", "Mid360Boxi"}
+# Upstream keys its fused LiDAR configuration and buffers by type.
+_KNOWN_LIDAR_TYPES = {
+    "AviaResple", "HAP360", "Hesai", "Mid360Boxi", "Mid70Avia", "Ouster"
+}
 
 
 @dataclass(frozen=True)
@@ -32,6 +21,17 @@ class LidarProfile:
     t_lb: tuple[float, float, float]
     topic_lidar: str = ""
     w_pt: float = 0.01
+
+    def upstream_parameters(self) -> dict[str, Any]:
+        return {
+            "topic_lidar": self.topic_lidar,
+            "lidar_type": self.lidar_type,
+            "scan_line": self.scan_line,
+            "blind": self.blind,
+            "q_lb": list(self.q_lb),
+            "t_lb": list(self.t_lb),
+            "w_pt": self.w_pt,
+        }
 
 
 @dataclass(frozen=True)
@@ -73,16 +73,12 @@ class RespleConfig:
         problems: list[str] = []
         if not self.lidars:
             problems.append("at least one lidar profile is required")
-        seen_names: dict[str, None] = {}
+        seen_names: set[str] = set()
         seen_types: dict[str, str] = {}
         for lidar in self.lidars:
             if lidar.name in seen_names:
                 problems.append(f"duplicate lidar name {lidar.name!r}")
-            seen_names[lidar.name] = None
-            # upstream RESPLE.cpp: `lidars.emplace(lidar.type, lidar)` and the
-            # matching lidars_data emplace. std::map::emplace keeps the first
-            # entry, so a second profile of the same type would be dropped and
-            # its sweeps fused into the first one's buffers.
+            seen_names.add(lidar.name)
             if lidar.lidar_type in seen_types:
                 problems.append(
                     f"lidars {seen_types[lidar.lidar_type]!r} and {lidar.name!r} both use "
@@ -157,16 +153,7 @@ class RespleConfig:
         """Requested config for the run manifest (ARCHITECTURE.md #7)."""
         data = {f.name: getattr(self, f.name) for f in fields(self)}
         data["lidars"] = [
-            {
-                "name": lidar.name,
-                "lidar_type": lidar.lidar_type,
-                "scan_line": lidar.scan_line,
-                "blind": lidar.blind,
-                "topic_lidar": lidar.topic_lidar,
-                "q_lb": list(lidar.q_lb),
-                "t_lb": list(lidar.t_lb),
-                "w_pt": lidar.w_pt,
-            }
+            {"name": lidar.name, **lidar.upstream_parameters()}
             for lidar in self.lidars
         ]
         return data
@@ -174,19 +161,9 @@ class RespleConfig:
     def upstream_parameters(self) -> dict[str, Any]:
         """Return the ROS2 parameter mapping accepted by upstream RESPLE."""
         params = self.native_parameters()
-        # Offline producer/consumer controls are intentionally not emitted:
-        # upstream RESPLE has no corresponding ROS parameters.
         params["lidars"] = [lidar.name for lidar in self.lidars]
         for lidar in self.lidars:
-            params[lidar.name] = {
-                "topic_lidar": lidar.topic_lidar,
-                "lidar_type": lidar.lidar_type,
-                "scan_line": lidar.scan_line,
-                "blind": lidar.blind,
-                "q_lb": list(lidar.q_lb),
-                "t_lb": list(lidar.t_lb),
-                "w_pt": lidar.w_pt,
-            }
+            params[lidar.name] = lidar.upstream_parameters()
         return params
 
     def upstream_yaml_mapping(self) -> dict[str, Any]:
@@ -240,13 +217,7 @@ def normalize_overrides(payload: dict[str, Any] | None) -> dict[str, Any]:
                 )
             profiles.append({"name": name, **profile})
         result["lidars"] = profiles
-        # A sibling mapping that no `lidars` entry selects is a lidar profile
-        # upstream silently never reads -- e.g. upstream's own
-        # config_jungfraujoch_tunnel_small.yaml keeps a `livox:` block while
-        # selecting only `["hesai"]`. Rejecting it is deliberate (a stale
-        # profile is far more often a mistake than an intent), but it must be
-        # named for what it is: resolve()'s generic unknown-field error would
-        # send the reader hunting for a mistyped scalar parameter instead.
+        # Upstream silently ignores profile mappings omitted from `lidars`.
         stray = sorted(
             key for key, value in result.items()
             if isinstance(value, dict) and key != "lidars"
@@ -278,11 +249,7 @@ def resolve(overrides: dict[str, Any] | None = None) -> RespleConfig:
             blind=float(entry.get("blind", 0.5)),
             q_lb=tuple(entry.get("q_lb", (1.0, 0.0, 0.0, 0.0))),
             t_lb=tuple(entry.get("t_lb", (0.0, 0.0, 0.0))),
-            # Resolve the offline placeholder here rather than in
-            # bindings.cpp's configure_lidar, so report(), the materialized
-            # upstream YAML and the native run all name the same topic
-            # (ARCHITECTURE.md #7). An empty string reaches upstream as an
-            # invalid topic name; the placeholder at least reads as one.
+            # Keep reports, emitted YAML, and native parameters consistent.
             topic_lidar=str(entry.get("topic_lidar") or f"/offline/{entry['name']}"),
             w_pt=float(entry.get("w_pt", 0.01)),
         )
@@ -290,11 +257,7 @@ def resolve(overrides: dict[str, Any] | None = None) -> RespleConfig:
     )
     if not overrides.get("topic_imu"):
         overrides["topic_imu"] = "/offline/imu"
-    # These are declared tuple[float, float, float]; YAML and
-    # native_parameters() both hand them over as lists. Coerce so the frozen
-    # dataclass actually holds the type it advertises (and stays hashable and
-    # comparable -- config == resolve(config.upstream_yaml_mapping()) is only
-    # true if it does). Non-sequences are left for validate() to report.
+    # YAML supplies lists; keep the frozen dataclass hashable and round-trippable.
     for key in ("cov_acc", "cov_gyro", "cov_ba", "cov_bg"):
         value = overrides.get(key)
         if isinstance(value, (list, tuple)):

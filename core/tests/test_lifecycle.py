@@ -44,7 +44,6 @@ _SESSION_SCRIPT = textwrap.dedent("""
 """)
 
 _SPARSE_INITIAL_MAP_SCRIPT = textwrap.dedent("""
-    import numpy as np
     from resple import RespleOdometry, config as cfgmod
     from tests.synthetic import run_stationary_session
 

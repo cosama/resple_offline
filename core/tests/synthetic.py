@@ -1,12 +1,4 @@
-"""Deterministic synthetic sensor stream for lifecycle/determinism tests.
-
-A stationary sensor inside a closed box room gives well-conditioned plane
-geometry in all three axes, so the estimator has a solvable problem without
-real data. (An earlier version of this test used scattered random-plane
-points with no walls in x/y -- that under-constrained geometry converged to
-zero committed poses even though the estimator ran without error. Box walls
-are what actually exercises the IEKF update path.)
-"""
+"""Deterministic, well-constrained box-room stream for lifecycle tests."""
 
 from __future__ import annotations
 
@@ -39,9 +31,7 @@ def box_room_sweep(position: np.ndarray, n_azimuth: int = 360, n_rings: int = 16
     return points, relative_times
 
 
-# RESPLE's gravity initialization averages its first 15 IMU samples, so the
-# first sweep must be preceded by at least that many for the run to be
-# reproducible (bindings.cpp: kInitGravitySamples). 0.1 s at 200 Hz is 21.
+# RESPLE's gravity initialization averages its first 15 IMU samples.
 IMU_LEAD_SECONDS = 0.1
 
 

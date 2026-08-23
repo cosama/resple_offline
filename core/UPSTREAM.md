@@ -127,15 +127,10 @@ would never consume -- `processData`'s IMU drain is behind
 
 ## Patch series (`patches/integration/`)
 
-One patch per upstream file, named after it. This keeps the mapping from
-"upstream file changed" to "patch to re-derive" one-to-one when the pin moves.
-
-A patch therefore carries several unrelated concerns. So that grouping by file
-does not hide the "why", **every hunk explains itself in the source**, tagged
+Patches are grouped by upstream component. To keep that grouping from hiding
+the rationale, **every hunk explains itself in the source**, tagged
 `resple_bridge:`. After staging, `grep -rn 'resple_bridge:' build/upstream_staged/`
-enumerates the entire local delta -- added calls and their rationale -- in the
-file a reader is actually compiling. The patch headers are only an index; the
-reasoning has a single home, at the sites, so the two cannot drift apart.
+enumerates the local integration points. Patch headers provide the overview.
 
 Hunks are generated with `diff -U3` against the pinned source and never
 hand-trimmed, and CMake applies them with `-F0`. Fuzz is what lets `patch`
@@ -163,46 +158,10 @@ lines per side can only ever apply by fuzzing.
   receives a measurement update because `collectMeasurements()` needs data
   beyond `maxTimeNs() + dt_ns` to form a batch. That trailing partial batch is
   reported as `metrics()["residual_points"]`.
-- **Real-dataset run done; no real-ROS2 parity run.** This sandbox has no
-  ROS2 (Humble) install, so output has not been compared against upstream's
-  own supported runtime. It has been run end-to-end on a real ~287 s
-  handheld-lidar dataset (`nglamp_50CPatio_2025_08_06_14_31_28_handheldsimple`,
-  53M points / 2873 sweeps / 57455 IMU samples) via `scripts/run_resple.py`
-  and compared qualitatively against a trusted `voxel_slam` reference run on
-  the same dataset: processed in 48.2 s (5.96x faster than the dataset's own
-  duration); 28377 poses (RESPLE samples ~knot_hz=100 Hz vs. voxel_slam's
-  10 Hz per-sweep rate); trajectory extent `[23.2, 14.5, 1.6]` m vs.
-  voxel_slam's `[22.0, 16.7, 1.6]` m (close); same duration (287.18 s vs.
-  286.9 s); top-down map/trajectory shape visually matches voxel_slam's
-  (same corridor layout, same out-and-back-plus-loop path, no
-  runaway/smearing/duplication). `path_length_m` came out ~2x voxel_slam's
-  (170 m vs. 89 m) with a correspondingly higher median/max instantaneous
-  speed. **Resolved**: computed directly from both frameworks'
-  `trajectory.csv` on this dataset -- RESPLE native (~100 Hz, 28377 poses)
-  path_length 170.3 m vs. voxel_slam native (~10 Hz, 2870 poses) 89.5 m;
-  resampling RESPLE (linear interpolation) onto voxel_slam's own timestamps
-  gives 99.0 m, and onto a plain fixed 10 Hz grid gives 98.9 m. So ~9/10 of
-  the apparent "2x" gap is a sampling-rate artifact (RESPLE's native median
-  step is 0.0053 m at 100 Hz vs. voxel_slam's 0.0283 m at 10 Hz; summing many
-  small noisy steps inflates measured arc length faster than true
-  displacement as sampling rate increases -- expected for any noisy
-  trajectory sampled ~10x denser, not a bug). The remaining ~11% gap after
-  rate-matching (99.0 m vs. 89.5 m) does look like genuine extra jitter in
-  RESPLE's estimate: measured jitter RMS (residual vs. a 0.5 s local-mean
-  smooth, at RESPLE's native 100 Hz) is ~1.1 cm -- not a blocker, but
-  `manifest.json`'s `speed_median_mps`/`speed_max_mps`/`path_length_m`
-  fields should not be compared directly against other frameworks' without
-  accounting for RESPLE's much higher native pose rate (a rate-matched
-  path-length metric in the manifest would be a reasonable future addition,
-  not done here). The current explicit-synchronization API supersedes the
-  original acceptance-time IMU check used for that run: a final sweep is
-  accepted and ticketed, `synchronize(ticket)` returns false when trailing IMU
-  or LiDAR lookahead is absent, and `finish()` reports the incomplete suffix.
-  The runner always closes the native worker in `finally`, including on an
-  unrelated replay error.
-  Still run the ARCHITECTURE.md validation ladder's bounded-real-data-parity
-  step against a real ROS2 build (upstream's own `Dockerfile`) before
-  trusting this for benchmark numbers.
+- **No real-ROS2 parity run.** The bridge has completed a real 287 s dataset
+  and produced a qualitatively consistent trajectory, but this environment
+  has no ROS2 Humble installation. Compare a bounded real-data run with
+  upstream's Docker image before treating the output as benchmark-grade.
 - **Determinism**: three known scheduler-dependent inputs are closed off for
   deterministic stepwise replay, which places `synchronize()` boundaries
   between LiDAR submissions.

@@ -11,12 +11,9 @@ __all__ = ["RespleOdometry", "config"]
 
 
 class RespleOdometry:
-    """Runs one RESPLE session for the lifetime of this object.
+    """Run one RESPLE session.
 
-    Upstream's estimator state (the ikd-tree map) is process-global and never
-    reset, so exactly one session may run per process -- construct a second
-    one and the native layer raises. Run one dataset (or segment) per
-    subprocess.
+    The upstream map is process-global, so each session needs a fresh process.
     """
 
     def __init__(self, cfg: "config.RespleConfig"):

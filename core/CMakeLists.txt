@@ -12,14 +12,8 @@ find_package(OpenMP)
 set(PYBIND11_FINDPYTHON ON)
 find_package(pybind11 CONFIG REQUIRED)
 
-# ---------------------------------------------------------------------------
 # Pinned upstream + auditable patch series
-#
-# The upstream submodule is never modified. A pristine copy of resple/ is
-# staged into the build tree at configure time and the checked-in patch
-# series is applied there, so `git -C upstream/RESPLE diff` stays empty and
-# the local delta is exactly the contents of patches/.
-# ---------------------------------------------------------------------------
+# Apply checked-in patches to a build-tree copy, leaving the submodule pristine.
 get_filename_component(RESPLE_BRIDGE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 set(UPSTREAM_RESPLE "${RESPLE_BRIDGE_ROOT}/upstream/RESPLE/resple")
 if(NOT EXISTS "${UPSTREAM_RESPLE}/src/RESPLE.cpp")
@@ -45,11 +39,7 @@ endif()
 
 foreach(patch_file IN LISTS RESPLE_INTEGRATION_PATCHES)
   execute_process(
-    # -F0: no fuzz. Without it patch(1) will happily place a hunk whose context
-    # no longer matches, which is exactly the silent upstream drift the staged
-    # copy exists to catch. (patch charges missing context against the fuzz
-    # budget too, so every hunk needs three context lines per side -- generate
-    # these patches with `diff -U3`, never by hand-trimming context.)
+    # Reject upstream drift instead of relocating mismatched hunks with fuzz.
     COMMAND "${PATCH_EXECUTABLE}" -F0 --silent --no-backup-if-mismatch -p0 -i "${patch_file}"
     WORKING_DIRECTORY "${RESPLE_STAGE}"
     RESULT_VARIABLE patch_result
@@ -63,17 +53,9 @@ foreach(patch_file IN LISTS RESPLE_INTEGRATION_PATCHES)
 endforeach()
 message(STATUS "RESPLE: applied ${RESPLE_PATCH_COUNT} patches to staged upstream")
 
-# ---------------------------------------------------------------------------
 # Native module
-#
-# bindings.cpp #includes the staged, patched src/RESPLE.cpp directly (one
-# translation unit), the same technique voxel_slam uses: RESPLE.cpp and
-# common_utils.h define several process-global variables (the ikd-tree,
-# NUM_OF_THREAD, NUM_MATCH_POINTS) with no `inline`/`extern` wrapper, so
-# compiling them into a second, separately-linked translation unit would be
-# an ODR violation. ikd_Tree.cpp has no such globals and stays a normal
-# separate source.
-# ---------------------------------------------------------------------------
+# bindings.cpp includes RESPLE.cpp because upstream defines process-global
+# state in its headers; keeping it in one translation unit avoids ODR violations.
 pybind11_add_module(_core NO_EXTRAS
   cpp/bindings.cpp
   "${RESPLE_STAGE}/include/ikd-Tree/ikd_Tree.cpp"
