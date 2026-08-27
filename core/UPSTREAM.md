@@ -100,6 +100,13 @@ that no `lidars` entry selects is rejected (upstream's own
 selecting only `["hesai"]`, and upstream simply never reads it): a stale
 profile is reported by name rather than ignored.
 
+`deterministic_replay` is a bridge-only execution policy, not an upstream ROS
+parameter. The Python library defaults it to false, preserving free-running
+upstream scheduling. `scripts/run_resple.py` explicitly enables it by default
+for benchmark replay, records the choice in the manifest, and offers
+`--no-deterministic-replay` for asynchronous parity checks. The field is
+reported by `RespleConfig.report()` but omitted from emitted upstream YAML.
+
 Multi-LiDAR configurations are supported: upstream fuses every configured
 LiDAR into one spline (its own `config_heap_testsite_hoenggerberg.yaml`
 selects `["livox", "hesai"]`), and the bridge carries them through as
@@ -132,16 +139,20 @@ the rationale, **every hunk explains itself in the source**, tagged
 `resple_bridge:`. After staging, `grep -rn 'resple_bridge:' build/upstream_staged/`
 enumerates the local integration points. Patch headers provide the overview.
 
-Hunks are generated with `diff -U3` against the pinned source and never
-hand-trimmed, and CMake applies them with `-F0`. Fuzz is what lets `patch`
+Hunks are generated with `diff -U3` against the pinned source and CMake applies
+them with `-F0`. The one documented exception is concern 8's single-condition
+replacement in `01-resple-node.patch`: the adjacent upstream lines contain
+trailing whitespace, so it retains the two clean following context lines
+instead of embedding whitespace in the patch. Fuzz is what lets `patch`
 place a hunk whose context no longer matches, which is precisely the silent
-drift the staged copy exists to catch -- and because `patch` charges *missing*
-context against the same fuzz budget, a hunk with fewer than three context
-lines per side can only ever apply by fuzzing.
+drift the staged copy exists to catch. `-F0` demands an *exact* context match,
+not a particular amount of it, so the shortened hunk still applies at zero
+fuzz and zero offset; what fewer context lines cost is drift evidence, not
+applicability, which is why this remains the single exception.
 
 | Patch | Upstream file(s) | What |
 |---|---|---|
-| `01-resple-node.patch` | `src/RESPLE.cpp` | Seven grouped changes, enumerated in the patch header: (1) widens `private:` to `public:` so `cpp/bindings.cpp` can inject sensor data and read spline state; (2) gives `processData()`'s `while (true)` loop a state-based exit and stable-blocked epoch publication, with each pass guarded by `bridge_processing_mutex`; (3) pops raw queues under their own mutex, notifies producer backpressure, and carries global sweep tickets through lockstep raw/point/batch sidecars (checked with `resple_bridge::check_invariant`, not `assert`: the shipped build is Release, so `assert` would be compiled out exactly where a desynced sidecar becomes undefined behavior), acknowledging initialization points only after `ikdtree.Build` and measurement points only after all work in their estimator batch; (4) three `initialization()` correctness fixes -- LIO waits for the fixed 15-sample gravity prefix, the initial map is built only from the *complete* fixed 100 ms window, and `propRCP(start_t_ns)` moves below both retry gates so it runs exactly once (on a spline that already covers `t` its whole effect is `cov_rcp += cov_sys`, so one call per retry pass scaled the initial covariance with a scheduling-dependent pass count); (5) fails immediately, with the relevant density settings, when a complete window holds fewer than the required 100 downsampled points; (6) initializes upstream's spline member to nullptr so a session that never reaches `initFilter` can finish and report no finalized pose safely; (7) guards upstream's unconditional `pt_meas.back()` in `processData()` -- `collectMeasurements()` returns true whenever it consumed anything, including a pass that discarded every point it popped as older than the active spline window, leaving `pt_meas` empty and the read out of bounds. |
+| `01-resple-node.patch` | `src/RESPLE.cpp` | Eight grouped concerns, enumerated in the patch header: bridge lifecycle, queue/ticket correctness, deterministic initialization, and preservation of upstream measurement readiness. Offline measurement determinism comes from timestamp-ordered producer submission, atomic sweeps, and explicit stable ticket boundaries; custom extension gates were removed because they changed nonlinear filter batching and regressed real-data output. See the patch header and `resple_bridge:` comments for the complete numbered rationale. |
 | `02-ikd-tree.patch` | `include/ikd-Tree/ikd_Tree.{h,cpp}` | Exposes the compatible ikd-tree rebuild quiescence barrier used only at explicit `synchronize()`/`finish()` boundaries and initializes the rebuild thread handle. Declaration and definition are one change and neither compiles alone, so both files share a patch. |
 
 ## Known limitations / open validation
@@ -179,10 +190,9 @@ lines per side can only ever apply by fuzzing.
   a scheduler-dependent short prefix. Once the missing IMU is submitted,
   initialization averages exactly 15 samples, making the initial orientation
   independent of how far the producer ran before the worker reached it.
-  Batch composition itself is *not* timing-dependent: `collectMeasurements()`
-  cuts on a spline-derived time window, and the OpenMP loops in `Estimator.h`
-  are element-wise writes with serial assembly, so no FP-reduction ordering is
-  involved. Two more were found and closed when multi-LiDAR support was
+  The OpenMP loops in `Estimator.h` are element-wise writes with serial
+  assembly, so no FP-reduction ordering is involved. Two more were found and
+  closed when multi-LiDAR support was
   added: several LiDARs make `initialization()` take a scheduling-dependent
   number of passes, which exposed both (see `01-resple-node.patch`) --
   (4) the initial map was seeded from a partially arrived 100 ms window, and
@@ -190,8 +200,19 @@ lines per side can only ever apply by fuzzing.
   passes across runs on the two-LiDAR synthetic scene, giving 4 distinct
   trajectories). Neither changes the single-LiDAR result: that scene's
   trajectory hash is unchanged across the fix.
-  `core/tests/test_lifecycle.py` asserts bit-identical trajectories
-  over 3 subprocess runs of the synthetic scene, single- and two-LiDAR.
+  (6, patch concern 8) Measurement readiness remains upstream's. Earlier
+  bridge versions added IMU and LiDAR lookahead on the spline-extension path.
+  Both changed when RESPLE performed nonlinear filter updates; the IMU half
+  caused a measured motionimuinit regression from ~1098 m to ~1148 m, while
+  the LiDAR half and its coarse-versus-exact horizon made no material change to
+  that regressed solution. The offline runner instead atomically commits each
+  timestamp-defined IMU interval through the next LiDAR header, submits each
+  sweep atomically, and establishes explicit stable ticket boundaries. At
+  close, the worker continues applying upstream readiness until
+  a closed pass makes no progress, so custom lookahead cannot strand otherwise
+  processable tail points. `core/tests/test_lifecycle.py` asserts bit-identical
+  trajectories over 3 subprocess runs of the synthetic scene, single- and
+  two-LiDAR, plus upstream batch-boundary and finite-tail behavior.
   Large real-data repeated replay is still recommended: that scene may not
   trigger large subtree rebuilds.
 

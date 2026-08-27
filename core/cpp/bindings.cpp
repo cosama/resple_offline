@@ -75,6 +75,13 @@ std::atomic<bool>& input_closed_flag() {
   static std::atomic<bool> flag{false};
   return flag;
 }
+// Written once by the constructor before start_worker(), then read-only on the
+// worker thread; relaxed atomics are enough and keep the per-batch read off any
+// lock.
+std::atomic<bool>& deterministic_replay_flag() {
+  static std::atomic<bool> flag{false};
+  return flag;
+}
 // Updated under progress_mutex() so the condition-variable predicate and
 // notification cannot race into a lost wakeup.
 std::atomic<std::uint64_t>& progress_epoch() {
@@ -98,6 +105,7 @@ void check_invariant(bool condition, const char* message) {
 
 void reset_session_state() noexcept {
   input_closed_flag().store(false, std::memory_order_release);
+  deterministic_replay_flag().store(false, std::memory_order_relaxed);
   progress_epoch().store(0, std::memory_order_release);
   auto& state = synchronization_state();
   std::lock_guard<std::mutex> lock(state.mutex);
@@ -115,6 +123,14 @@ void reset_session_state() noexcept {
 
 bool input_closed() noexcept {
   return input_closed_flag().load(std::memory_order_acquire);
+}
+
+bool deterministic_replay() noexcept {
+  return deterministic_replay_flag().load(std::memory_order_relaxed);
+}
+
+void set_deterministic_replay(bool enabled) noexcept {
+  deterministic_replay_flag().store(enabled, std::memory_order_relaxed);
 }
 
 void note_progress() noexcept {
@@ -451,7 +467,7 @@ struct LidarStream {
 class RespleOdometry {
  public:
   RespleOdometry(const py::dict& params, const std::vector<py::dict>& lidars,
-                int max_pending_sweeps)
+                int max_pending_sweeps, bool deterministic_replay)
       : max_pending_sweeps_(max_pending_sweeps) {
     if (lidars.empty()) throw py::value_error("at least one lidar is required");
     if (max_pending_sweeps_ < 1)
@@ -465,6 +481,10 @@ class RespleOdometry {
           "subprocess.");
 
     resple_bridge::reset_session_state();
+    // Must be set before start_worker(): the worker reads it on every
+    // collectMeasurements() call to decide batch composition, and
+    // reset_session_state() has just cleared it to the default.
+    resple_bridge::set_deterministic_replay(deterministic_replay);
 
     node_ = rclcpp::Node::make_shared("RESPLE");
     apply_parameters(params);
@@ -546,6 +566,62 @@ class RespleOdometry {
       resple_->imu_int_buff.push_back(message);
       last_imu_stamp_ = timestamp;
       ++imu_pushed_;
+      resple_bridge::note_imu_submission();
+    }
+
+    auto& state = recorder();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.imu_samples = imu_pushed_;
+    return state.imu_samples;
+  }
+
+  std::int64_t push_imu_batch(
+      const std::vector<double>& timestamps,
+      const std::vector<std::vector<double>>& accelerations,
+      const std::vector<std::vector<double>>& angular_velocities) {
+    throw_if_failed();
+    if (resple_->if_lidar_only)
+      throw py::value_error("push_imu_batch is not valid in LiDAR-only mode");
+    if (timestamps.empty()) throw py::value_error("IMU batch must not be empty");
+    if (accelerations.size() != timestamps.size() ||
+        angular_velocities.size() != timestamps.size())
+      throw py::value_error("IMU batch fields must have equal lengths");
+
+    Eigen::aligned_vector<sensor_msgs::msg::Imu::SharedPtr> messages;
+    messages.reserve(timestamps.size());
+    double previous = last_imu_stamp_;
+    for (std::size_t i = 0; i < timestamps.size(); ++i) {
+      if (!std::isfinite(timestamps[i]) || timestamps[i] <= previous)
+        throw py::value_error("imu timestamps must be finite and strictly increasing");
+      if (accelerations[i].size() != 3 || angular_velocities[i].size() != 3)
+        throw py::value_error("IMU measurements must have length 3");
+      auto message = std::make_shared<sensor_msgs::msg::Imu>();
+      message->header.stamp = rclcpp::Time(seconds_to_ns(timestamps[i]));
+      for (int axis = 0; axis < 3; ++axis) {
+        if (!std::isfinite(accelerations[i][axis]) ||
+            !std::isfinite(angular_velocities[i][axis]))
+          throw py::value_error("IMU measurements must be finite");
+      }
+      message->linear_acceleration.x = accelerations[i][0];
+      message->linear_acceleration.y = accelerations[i][1];
+      message->linear_acceleration.z = accelerations[i][2];
+      message->angular_velocity.x = angular_velocities[i][0];
+      message->angular_velocity.y = angular_velocities[i][1];
+      message->angular_velocity.z = angular_velocities[i][2];
+      messages.push_back(std::move(message));
+      previous = timestamps[i];
+    }
+
+    {
+      std::lock_guard<std::mutex> input_lock(input_mutex_);
+      throw_if_input_closed();
+      // Commit one timestamp-defined producer interval atomically. The worker
+      // sees either none or all of it, never a scheduler-dependent prefix.
+      std::lock_guard<std::mutex> lock(resple_->m_buff);
+      resple_->imu_int_buff.insert(
+          resple_->imu_int_buff.end(), messages.begin(), messages.end());
+      last_imu_stamp_ = timestamps.back();
+      imu_pushed_ += static_cast<std::int64_t>(timestamps.size());
       resple_bridge::note_imu_submission();
     }
 
@@ -811,6 +887,7 @@ class RespleOdometry {
     result["residual_points"] = state.residual_points;
     add_ticket_counters(result);
     result["estimator_threads"] = NUM_OF_THREAD;
+    result["deterministic_replay"] = resple_bridge::deterministic_replay();
     result["per_lidar"] = per_lidar();
     return result;
   }
@@ -1136,11 +1213,14 @@ PYBIND11_MODULE(_core, module) {
   module.doc() = "Offline host for pinned upstream RESPLE";
 
   py::class_<RespleOdometry>(module, "RespleOdometry")
-      .def(py::init<const py::dict&, const std::vector<py::dict>&, int>(),
+      .def(py::init<const py::dict&, const std::vector<py::dict>&, int, bool>(),
            py::arg("parameters"), py::arg("lidars"),
-           py::arg("max_pending_sweeps") = 8)
+           py::arg("max_pending_sweeps") = 8,
+           py::arg("deterministic_replay") = false)
       .def("push_imu", &RespleOdometry::push_imu, py::arg("timestamp"),
            py::arg("acceleration"), py::arg("angular_velocity"))
+      .def("push_imu_batch", &RespleOdometry::push_imu_batch, py::arg("timestamps"),
+           py::arg("accelerations"), py::arg("angular_velocities"))
       .def("push_lidar", &RespleOdometry::push_lidar, py::arg("timestamp"), py::arg("points"),
            py::arg("relative_times"), py::arg("lines") = py::none(),
            py::arg("tags") = py::none(), py::arg("lidar") = std::string())

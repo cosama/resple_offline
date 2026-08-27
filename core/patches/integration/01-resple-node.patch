@@ -35,10 +35,21 @@ This header is only an index; the reasoning has one home, at the sites.
 7. An upstream out-of-bounds read: processData() takes pt_meas.back() on every
    true return from collectMeasurements(), which also covers a pass that
    discarded every point it popped and left pt_meas empty.
+8. Measurement composition deliberately remains upstream's. Offline
+   determinism comes from timestamp-ordered producer submission, atomic sweep
+   enqueue/dequeue, and explicit stable ticket boundaries. Additional IMU or
+   LiDAR extension gates change nonlinear filter batch composition throughout
+   a run; they do not merely remove a scheduling race. The worker's explicit
+   close/no-progress lifecycle then applies upstream's finite-buffer readiness
+   at end-of-stream without a custom gate stranding processable input.
 
-Hunks are generated with `diff -U3`, never hand-trimmed: patch(1) charges
-missing context against its fuzz budget, so a hunk with fewer than three
-context lines per side cannot apply under the `-F0` the build requires.
+Hunks are generated with `diff -U3`, never hand-trimmed, except concern 8's
+single-condition replacement: its adjacent upstream closing lines contain
+trailing whitespace, so that hunk retains the two clean following context
+lines instead of copying whitespace into this patch. What `-F0` requires is an
+*exact* context match, not three lines of it, so the shortened hunk still
+applies at zero fuzz and zero offset; fewer context lines only narrow the
+evidence of drift, which is why this stays the single exception.
 
 --- src/RESPLE.cpp
 +++ src/RESPLE.cpp

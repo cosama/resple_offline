@@ -26,6 +26,7 @@ _SESSION_SCRIPT = textwrap.dedent("""
     from tests.synthetic import run_stationary_session
 
     cfg = cfgmod.resolve({
+        "deterministic_replay": True,
         "lidars": [{
             "name": "lidar0", "lidar_type": "Ouster", "scan_line": 64, "blind": 0.3,
             "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01,
@@ -80,7 +81,7 @@ _SYNCHRONIZATION_SCRIPT = textwrap.dedent("""
     from resple import RespleOdometry, config as cfgmod
     from tests.synthetic import box_room_sweep
 
-    cfg = cfgmod.resolve({"lidars": [{
+    cfg = cfgmod.resolve({"deterministic_replay": True, "lidars": [{
         "name": "lidar0", "lidar_type": "Ouster", "scan_line": 64, "blind": 0.3,
         "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01,
     }]})
@@ -103,7 +104,7 @@ _SYNCHRONIZATION_SCRIPT = textwrap.dedent("""
 
 _INITIALIZATION_BOUNDARY_SCRIPT = textwrap.dedent("""
     from resple import RespleOdometry, config as cfgmod
-    cfg = cfgmod.resolve({"lidars": [{
+    cfg = cfgmod.resolve({"deterministic_replay": True, "lidars": [{
         "name": "lidar0", "lidar_type": "Ouster", "scan_line": 64, "blind": 0.3,
         "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01,
     }]})
@@ -262,7 +263,8 @@ _BACKPRESSURE_SCRIPT = textwrap.dedent("""
     from resple import RespleOdometry, config as cfgmod
     from tests.synthetic import box_room_sweep, GRAVITY
 
-    cfg = cfgmod.resolve({"max_pending_sweeps": 1, "lidars": [{
+    cfg = cfgmod.resolve({
+        "deterministic_replay": False, "max_pending_sweeps": 1, "lidars": [{
         "name": "lidar0", "lidar_type": "Ouster", "scan_line": 64, "blind": 0.3,
         "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01,
     }]})
@@ -282,6 +284,7 @@ _BACKPRESSURE_SCRIPT = textwrap.dedent("""
     print("POSES", result["trajectory"].shape[0])
     print("SWEEPS", result["metrics"]["lidar_sweeps_pushed"])
     print("RESIDUAL", result["metrics"]["residual_sweeps"])
+    print("DETERMINISTIC", result["metrics"]["deterministic_replay"])
 """)
 
 
@@ -290,6 +293,32 @@ def test_backpressure_wait_is_released_by_worker_progress():
     assert int(lines["SWEEPS"]) == 15, "producer did not get through its sweeps"
     assert int(lines["POSES"]) > 0
     assert lines["RESIDUAL"] == "0"
+    assert lines["DETERMINISTIC"] == "False"
+
+
+_IMU_BATCH_SCRIPT = textwrap.dedent("""
+    from resple import RespleOdometry, config as cfgmod
+
+    cfg = cfgmod.resolve({"deterministic_replay": True, "lidars": [{
+        "name": "lidar0", "lidar_type": "Ouster", "scan_line": 64, "blind": 0.3,
+        "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01,
+    }]})
+    odom = RespleOdometry(cfg)
+    samples = [
+        (i / 200.0, [0.0, 0.0, 9.81], [0.0, 0.0, 0.0])
+        for i in range(20)
+    ]
+    print("COUNT", odom.push_imu_batch(samples))
+    print("SYNC", odom.synchronize())
+    print("FINISH", odom.finish()["metrics"]["imu_samples"])
+""")
+
+
+def test_imu_batch_commits_complete_interval_and_synchronizes():
+    lines = _run_inline(_IMU_BATCH_SCRIPT)
+    assert lines["COUNT"] == "20"
+    assert lines["SYNC"] == "True"
+    assert lines["FINISH"] == "20"
 
 
 # Two LiDARs of *different* types: upstream keys `lidars`/`lidars_data` by
@@ -303,6 +332,7 @@ _MULTI_LIDAR_SCRIPT = textwrap.dedent("""
 
     q_lb, t_lb = second_lidar_extrinsics()
     cfg = cfgmod.resolve({
+        "deterministic_replay": True,
         "lidars": [
             {"name": "front", "lidar_type": "Ouster", "scan_line": 64, "blind": 0.3,
              "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01},
@@ -394,3 +424,95 @@ def test_two_lidars_of_the_same_type_are_rejected():
     problems = next(line for line in proc.stdout.splitlines() if line.startswith("PROBLEMS"))
     assert "both use lidar_type 'Ouster'" in problems, problems
     assert "invalid RespleConfig" in proc.stderr
+
+
+# A short sweep against a long knot interval: each 10 ms sweep is followed by a
+# 90 ms hole, and `knot_hz` 20 makes `dt_ns` 50 ms. `collectMeasurements()`
+# therefore reaches its spline-extension path -- `pt_min_time` past
+# `spline->maxTimeNs()` -- while the buffer holds a single short sweep, which is
+# exactly where the point-pop loop can drain `pt_buff` empty instead of stopping
+# on the timestamp bound. `num_points_upd` is raised so the pop is not capped
+# before it gets there; the default 100 masks the drain entirely.
+_EXTENSION_COVERAGE_SCRIPT = textwrap.dedent("""
+    import json
+    from collections import deque
+    import numpy as np
+    from resple import RespleOdometry, config as cfgmod
+    from tests.synthetic import box_room_sweep, GRAVITY, IMU_LEAD_SECONDS
+
+    SWEEP_SPAN = 0.01
+    cfg = cfgmod.resolve({
+        "deterministic_replay": True,
+        "knot_hz": 20,
+        "num_points_upd": 2000,
+        "max_pending_sweeps": 64,
+        "lidars": [{
+            "name": "lidar0", "lidar_type": "Ouster", "scan_line": 64, "blind": 0.3,
+            "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01,
+        }],
+    })
+    odom = RespleOdometry(cfg)
+    duration, imu_hz, lidar_hz = 1.5, 200.0, 10.0
+    next_t, index, unresolved, lags = 0.0, 0, deque(), []
+    for i in range(int(duration * imu_hz) + 50):
+        stamp = i / imu_hz
+        odom.push_imu(stamp, [0.0, 0.0, GRAVITY], [0.0, 0.0, 0.0])
+        if i == 14:
+            assert odom.synchronize(), "initialization IMU prefix did not synchronize"
+        while next_t <= stamp - IMU_LEAD_SECONDS and next_t < duration:
+            points, relative_times = box_room_sweep(
+                np.zeros(3), n_azimuth=120, n_rings=8, seed=index,
+            )
+            unresolved.append((
+                odom.push_lidar(next_t, points, relative_times * (SWEEP_SPAN / 0.1)),
+                index,
+            ))
+            index += 1
+            next_t += 1.0 / lidar_hz
+            # Every submission is followed by a synchronization boundary, so the
+            # worker is quiescent whenever a lag is recorded: `lag` is how many
+            # further sweeps had to be submitted before this one was consumed.
+            while unresolved and odom.synchronize(unresolved[0][0]):
+                lags.append(index - 1 - unresolved.popleft()[1])
+    metrics = odom.finish()["metrics"]
+    print("LAGS", json.dumps(lags))
+    print("RESIDUAL", metrics["residual_sweeps"], metrics["residual_points"])
+""")
+
+
+def _run_extension_coverage() -> dict:
+    proc = subprocess.run(
+        [sys.executable, "-c", _EXTENSION_COVERAGE_SCRIPT],
+        cwd=CORE_DIR, capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return dict(line.split(" ", 1) for line in proc.stdout.splitlines() if " " in line)
+
+
+def test_spline_extension_preserves_upstream_lidar_batch_boundary():
+    """Complete atomic sweeps retain upstream's LiDAR readiness behavior.
+
+    In this scene a sweep spans 10 ms and `dt_ns` is 50 ms. An added extension
+    horizon would force every sweep to wait for a later one and regroup points
+    across sweep boundaries. The offline producer instead submits each sweep
+    atomically and synchronizes at a stable boundary, so at least one sweep is
+    processed without artificial LiDAR lookahead (zero lag).
+    """
+    import json
+
+    lines = _run_extension_coverage()
+    lags = json.loads(lines["LAGS"])
+    assert lags, "no sweep was consumed at all"
+    assert min(lags) == 0, f"every batch was delayed across a sweep boundary: lags={lags}"
+
+
+def test_spline_extension_drains_finite_tail_after_input_closes():
+    """EOF drains every tail point that upstream readiness can process.
+
+    Once input is explicitly closed, the worker keeps forming upstream batches
+    until a complete pass makes no progress; only then may it exit.
+    """
+    lines = _run_extension_coverage()
+    residual_sweeps, residual_points = lines["RESIDUAL"].split()
+    assert residual_sweeps == "0", "a raw sweep was never even dequeued"
+    assert residual_points == "0", "an upstream-processable tail was left unconsumed"

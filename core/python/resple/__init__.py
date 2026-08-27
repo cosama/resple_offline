@@ -37,6 +37,7 @@ class RespleOdometry:
                 for lidar in cfg.lidars
             ],
             max_pending_sweeps=cfg.max_pending_sweeps,
+            deterministic_replay=cfg.deterministic_replay,
         )
 
     @property
@@ -53,6 +54,15 @@ class RespleOdometry:
         """
         return self._native.push_imu(
             float(timestamp), list(map(float, acceleration)), list(map(float, angular_velocity))
+        )
+
+    def push_imu_batch(self, samples) -> int:
+        """Atomically commit a timestamp-ordered finite interval of IMU input."""
+        rows = list(samples)
+        return self._native.push_imu_batch(
+            [float(row[0]) for row in rows],
+            [list(map(float, row[1])) for row in rows],
+            [list(map(float, row[2])) for row in rows],
         )
 
     def push_lidar(
