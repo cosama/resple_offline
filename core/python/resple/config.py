@@ -67,14 +67,6 @@ class RespleConfig:
     acc_ratio: bool = False  # True if IMU linear_acceleration is in g, not m/s^2
     lidar_time_offset: float = 0.0
 
-    max_pending_sweeps: int = 8
-    # Bridge-only (not an upstream ROS parameter; excluded from
-    # native_parameters()/upstream_yaml_mapping(), reported in report()).
-    # Require complete timestamp coverage before forming each LIO measurement
-    # batch, so producer/worker timing cannot change which IMU samples it sees.
-    # The library stays asynchronous by default; the benchmark runner opts in.
-    deterministic_replay: bool = False
-
     def validate(self) -> list[str]:
         problems: list[str] = []
         if not self.lidars:
@@ -112,10 +104,6 @@ class RespleConfig:
             problems.append("num_points_upd must be positive")
         if self.point_filter_num <= 0:
             problems.append("point_filter_num must be positive")
-        if self.max_pending_sweeps < 1:
-            problems.append("max_pending_sweeps must be at least 1")
-        if type(self.deterministic_replay) is not bool:
-            problems.append("deterministic_replay must be a bool")
         if len(self.cov_acc) != 3 or len(self.cov_gyro) != 3:
             problems.append("cov_acc and cov_gyro must have length 3")
         if len(self.cov_ba) != 3 or len(self.cov_bg) != 3:

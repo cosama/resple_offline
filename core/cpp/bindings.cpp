@@ -75,13 +75,6 @@ std::atomic<bool>& input_closed_flag() {
   static std::atomic<bool> flag{false};
   return flag;
 }
-// Written once by the constructor before start_worker(), then read-only on the
-// worker thread; relaxed atomics are enough and keep the per-batch read off any
-// lock.
-std::atomic<bool>& deterministic_replay_flag() {
-  static std::atomic<bool> flag{false};
-  return flag;
-}
 // Updated under progress_mutex() so the condition-variable predicate and
 // notification cannot race into a lost wakeup.
 std::atomic<std::uint64_t>& progress_epoch() {
@@ -105,7 +98,6 @@ void check_invariant(bool condition, const char* message) {
 
 void reset_session_state() noexcept {
   input_closed_flag().store(false, std::memory_order_release);
-  deterministic_replay_flag().store(false, std::memory_order_relaxed);
   progress_epoch().store(0, std::memory_order_release);
   auto& state = synchronization_state();
   std::lock_guard<std::mutex> lock(state.mutex);
@@ -123,14 +115,6 @@ void reset_session_state() noexcept {
 
 bool input_closed() noexcept {
   return input_closed_flag().load(std::memory_order_acquire);
-}
-
-bool deterministic_replay() noexcept {
-  return deterministic_replay_flag().load(std::memory_order_relaxed);
-}
-
-void set_deterministic_replay(bool enabled) noexcept {
-  deterministic_replay_flag().store(enabled, std::memory_order_relaxed);
 }
 
 void note_progress() noexcept {
@@ -467,7 +451,7 @@ struct LidarStream {
 class RespleOdometry {
  public:
   RespleOdometry(const py::dict& params, const std::vector<py::dict>& lidars,
-                int max_pending_sweeps, bool deterministic_replay)
+                int max_pending_sweeps)
       : max_pending_sweeps_(max_pending_sweeps) {
     if (lidars.empty()) throw py::value_error("at least one lidar is required");
     if (max_pending_sweeps_ < 1)
@@ -481,10 +465,6 @@ class RespleOdometry {
           "subprocess.");
 
     resple_bridge::reset_session_state();
-    // Must be set before start_worker(): the worker reads it on every
-    // collectMeasurements() call to decide batch composition, and
-    // reset_session_state() has just cleared it to the default.
-    resple_bridge::set_deterministic_replay(deterministic_replay);
 
     node_ = rclcpp::Node::make_shared("RESPLE");
     apply_parameters(params);
@@ -887,7 +867,6 @@ class RespleOdometry {
     result["residual_points"] = state.residual_points;
     add_ticket_counters(result);
     result["estimator_threads"] = NUM_OF_THREAD;
-    result["deterministic_replay"] = resple_bridge::deterministic_replay();
     result["per_lidar"] = per_lidar();
     return result;
   }
@@ -1213,10 +1192,9 @@ PYBIND11_MODULE(_core, module) {
   module.doc() = "Offline host for pinned upstream RESPLE";
 
   py::class_<RespleOdometry>(module, "RespleOdometry")
-      .def(py::init<const py::dict&, const std::vector<py::dict>&, int, bool>(),
+      .def(py::init<const py::dict&, const std::vector<py::dict>&, int>(),
            py::arg("parameters"), py::arg("lidars"),
-           py::arg("max_pending_sweeps") = 8,
-           py::arg("deterministic_replay") = false)
+           py::arg("max_pending_sweeps") = 8)
       .def("push_imu", &RespleOdometry::push_imu, py::arg("timestamp"),
            py::arg("acceleration"), py::arg("angular_velocity"))
       .def("push_imu_batch", &RespleOdometry::push_imu_batch, py::arg("timestamps"),

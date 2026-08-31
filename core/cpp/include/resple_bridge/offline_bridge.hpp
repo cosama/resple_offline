@@ -43,13 +43,6 @@ void note_stable_blocked(std::uint64_t submission_epoch) noexcept;
 void wait_for_synchronization_release(std::uint64_t submission_epoch) noexcept;
 void note_worker_finished() noexcept;
 
-// Deterministic replay makes measurement-batch composition a function of
-// sensor timestamps rather than of how far the producer has run when the
-// estimator worker examines its buffers. Set once before the worker starts;
-// read only by that worker thereafter.
-bool deterministic_replay() noexcept;
-void set_deterministic_replay(bool enabled) noexcept;
-
 bool wait_for_stable_blocked(std::uint64_t submission_epoch) noexcept;
 std::uint64_t request_synchronization(std::uint64_t submission_epoch);
 void complete_synchronization(std::uint64_t request_generation);

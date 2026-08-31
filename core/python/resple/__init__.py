@@ -16,11 +16,22 @@ class RespleOdometry:
     The upstream map is process-global, so each session needs a fresh process.
     """
 
-    def __init__(self, cfg: "config.RespleConfig"):
+    def __init__(self, cfg: "config.RespleConfig", *, max_pending_sweeps: int = 8):
+        """`cfg` is the upstream RESPLE parameter set.
+
+        `max_pending_sweeps` is offline execution policy, not an upstream
+        parameter and not an estimator-quality knob: it bounds how many
+        accepted-but-unprocessed sweeps the producer may run ahead by, so a
+        fast producer cannot grow the queue without bound. It never changes
+        results.
+        """
         problems = cfg.validate()
         if problems:
             raise ValueError("invalid RespleConfig: " + "; ".join(problems))
+        if int(max_pending_sweeps) < 1:
+            raise ValueError("max_pending_sweeps must be at least 1")
         self._cfg = cfg
+        self._max_pending_sweeps = int(max_pending_sweeps)
         self._native = _RespleOdometry(
             parameters=cfg.native_parameters(),
             lidars=[
@@ -36,8 +47,7 @@ class RespleOdometry:
                 }
                 for lidar in cfg.lidars
             ],
-            max_pending_sweeps=cfg.max_pending_sweeps,
-            deterministic_replay=cfg.deterministic_replay,
+            max_pending_sweeps=self._max_pending_sweeps,
         )
 
     @property

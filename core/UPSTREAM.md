@@ -100,12 +100,17 @@ that no `lidars` entry selects is rejected (upstream's own
 selecting only `["hesai"]`, and upstream simply never reads it): a stale
 profile is reported by name rather than ignored.
 
-`deterministic_replay` is a bridge-only execution policy, not an upstream ROS
-parameter. The Python library defaults it to false, preserving free-running
-upstream scheduling. `scripts/run_resple.py` explicitly enables it by default
-for benchmark replay, records the choice in the manifest, and offers
-`--no-deterministic-replay` for asynchronous parity checks. The field is
-reported by `RespleConfig.report()` but omitted from emitted upstream YAML.
+`RespleConfig` carries only upstream ROS parameters: every scalar field maps
+one-to-one onto a `CommonUtils::readParam` name in upstream `RESPLE.cpp`, and
+every per-LiDAR field onto a `LidarConfig` read. Offline execution policy is
+never a config field. `max_pending_sweeps` -- the producer-side queue bound --
+is a `RespleOdometry` constructor argument, surfaced by
+`scripts/run_resple.py` as `--max-pending-sweeps` with a default, and recorded
+in the manifest's `execution` block rather than in the config report.
+
+Deterministic replay is not a mode. It is the structural property that the
+host drives the library through `synchronize()`, so there is no flag, config
+field, or CLI toggle for it.
 
 Multi-LiDAR configurations are supported: upstream fuses every configured
 LiDAR into one spline (its own `config_heap_testsite_hoenggerberg.yaml`

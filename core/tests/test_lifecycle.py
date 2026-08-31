@@ -26,7 +26,6 @@ _SESSION_SCRIPT = textwrap.dedent("""
     from tests.synthetic import run_stationary_session
 
     cfg = cfgmod.resolve({
-        "deterministic_replay": True,
         "lidars": [{
             "name": "lidar0", "lidar_type": "Ouster", "scan_line": 64, "blind": 0.3,
             "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01,
@@ -81,7 +80,7 @@ _SYNCHRONIZATION_SCRIPT = textwrap.dedent("""
     from resple import RespleOdometry, config as cfgmod
     from tests.synthetic import box_room_sweep
 
-    cfg = cfgmod.resolve({"deterministic_replay": True, "lidars": [{
+    cfg = cfgmod.resolve({"lidars": [{
         "name": "lidar0", "lidar_type": "Ouster", "scan_line": 64, "blind": 0.3,
         "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01,
     }]})
@@ -104,7 +103,7 @@ _SYNCHRONIZATION_SCRIPT = textwrap.dedent("""
 
 _INITIALIZATION_BOUNDARY_SCRIPT = textwrap.dedent("""
     from resple import RespleOdometry, config as cfgmod
-    cfg = cfgmod.resolve({"deterministic_replay": True, "lidars": [{
+    cfg = cfgmod.resolve({"lidars": [{
         "name": "lidar0", "lidar_type": "Ouster", "scan_line": 64, "blind": 0.3,
         "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01,
     }]})
@@ -263,12 +262,11 @@ _BACKPRESSURE_SCRIPT = textwrap.dedent("""
     from resple import RespleOdometry, config as cfgmod
     from tests.synthetic import box_room_sweep, GRAVITY
 
-    cfg = cfgmod.resolve({
-        "deterministic_replay": False, "max_pending_sweeps": 1, "lidars": [{
+    cfg = cfgmod.resolve({"lidars": [{
         "name": "lidar0", "lidar_type": "Ouster", "scan_line": 64, "blind": 0.3,
         "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01,
     }]})
-    odom = RespleOdometry(cfg)
+    odom = RespleOdometry(cfg, max_pending_sweeps=1)
     next_t, index = 0.0, 0
     for i in range(350):
         stamp = i / 200.0
@@ -284,7 +282,6 @@ _BACKPRESSURE_SCRIPT = textwrap.dedent("""
     print("POSES", result["trajectory"].shape[0])
     print("SWEEPS", result["metrics"]["lidar_sweeps_pushed"])
     print("RESIDUAL", result["metrics"]["residual_sweeps"])
-    print("DETERMINISTIC", result["metrics"]["deterministic_replay"])
 """)
 
 
@@ -293,13 +290,12 @@ def test_backpressure_wait_is_released_by_worker_progress():
     assert int(lines["SWEEPS"]) == 15, "producer did not get through its sweeps"
     assert int(lines["POSES"]) > 0
     assert lines["RESIDUAL"] == "0"
-    assert lines["DETERMINISTIC"] == "False"
 
 
 _IMU_BATCH_SCRIPT = textwrap.dedent("""
     from resple import RespleOdometry, config as cfgmod
 
-    cfg = cfgmod.resolve({"deterministic_replay": True, "lidars": [{
+    cfg = cfgmod.resolve({"lidars": [{
         "name": "lidar0", "lidar_type": "Ouster", "scan_line": 64, "blind": 0.3,
         "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01,
     }]})
@@ -332,7 +328,6 @@ _MULTI_LIDAR_SCRIPT = textwrap.dedent("""
 
     q_lb, t_lb = second_lidar_extrinsics()
     cfg = cfgmod.resolve({
-        "deterministic_replay": True,
         "lidars": [
             {"name": "front", "lidar_type": "Ouster", "scan_line": 64, "blind": 0.3,
              "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01},
@@ -442,16 +437,14 @@ _EXTENSION_COVERAGE_SCRIPT = textwrap.dedent("""
 
     SWEEP_SPAN = 0.01
     cfg = cfgmod.resolve({
-        "deterministic_replay": True,
         "knot_hz": 20,
         "num_points_upd": 2000,
-        "max_pending_sweeps": 64,
         "lidars": [{
             "name": "lidar0", "lidar_type": "Ouster", "scan_line": 64, "blind": 0.3,
             "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01,
         }],
     })
-    odom = RespleOdometry(cfg)
+    odom = RespleOdometry(cfg, max_pending_sweeps=64)
     duration, imu_hz, lidar_hz = 1.5, 200.0, 10.0
     next_t, index, unresolved, lags = 0.0, 0, deque(), []
     for i in range(int(duration * imu_hz) + 50):
