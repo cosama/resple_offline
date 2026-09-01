@@ -162,12 +162,7 @@ class RespleConfig:
 
 
 def normalize_overrides(payload: dict[str, Any] | None) -> dict[str, Any]:
-    """Normalize legacy-flat or upstream ROS2 configuration to one mapping.
-
-    Upstream represents ``lidars`` as a list of profile names whose mappings
-    are siblings under ``ros__parameters``.  The bridge's typed model stores
-    the same information as a list of profile mappings.
-    """
+    """Normalize supported upstream configurations."""
     if payload is None:
         return {}
     if not isinstance(payload, dict):
@@ -218,12 +213,7 @@ def normalize_overrides(payload: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def resolve(overrides: dict[str, Any] | None = None) -> RespleConfig:
-    """Build a RespleConfig from defaults plus a flat dict of overrides.
-
-    `overrides["lidars"]`, if present, must already be a list of dicts with
-    LidarProfile's fields; everything else overrides a scalar RespleConfig
-    field by name.
-    """
+    """Resolve one typed upstream configuration."""
     overrides = normalize_overrides(overrides)
     lidars_raw = overrides.pop("lidars", None)
     if not lidars_raw:

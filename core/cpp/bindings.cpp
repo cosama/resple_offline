@@ -23,13 +23,7 @@
 #include <thread>
 #include <vector>
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wreorder"
-#pragma GCC diagnostic ignored "-Wsign-compare"
-#pragma GCC diagnostic ignored "-Wunused-but-set-variable"
-#pragma GCC diagnostic ignored "-Wunused-variable"
 #include "RESPLE.cpp"
-#pragma GCC diagnostic pop
 
 namespace py = pybind11;
 
@@ -817,7 +811,6 @@ class RespleOdometry {
     result["residual_sweeps"] = state.residual_sweeps;
     result["residual_points"] = state.residual_points;
     add_ticket_counters(result);
-    result["estimator_threads"] = NUM_OF_THREAD;
     result["per_lidar"] = per_lidar();
     return result;
   }

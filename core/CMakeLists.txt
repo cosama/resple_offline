@@ -58,9 +58,6 @@ pybind11_add_module(_core NO_EXTRAS
   "${RESPLE_STAGE}/include/ikd-Tree/ikd_Tree.cpp"
 )
 
-set_source_files_properties("${RESPLE_STAGE}/include/ikd-Tree/ikd_Tree.cpp" PROPERTIES
-  COMPILE_OPTIONS "-Wno-unused-variable;-Wno-unused-but-set-variable;-Wno-sign-compare;-Wno-maybe-uninitialized")
-
 target_include_directories(_core PRIVATE
   cpp/compat
   cpp/include
@@ -71,7 +68,6 @@ target_include_directories(_core PRIVATE
 
 target_compile_definitions(_core PRIVATE
   EIGEN_MALLOC_ALREADY_ALIGNED=1
-  EIGEN_INITIALIZE_MATRICES_BY_NAN=1
 )
 target_compile_options(_core PRIVATE -O3 -Wall)
 

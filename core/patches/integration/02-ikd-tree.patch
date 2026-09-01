@@ -18,19 +18,17 @@ rebuilds to complete. Ordinary estimator batches retain upstream scheduling.
  public:
      KD_TREE(float delete_param = 0.5, float balance_param = 0.6, float box_length = 0.2);
      ~KD_TREE();
-+    void wait_for_pending_rebuild();  // resple_bridge: await tree quiescence
++    void wait_for_pending_rebuild();  // Await tree quiescence.
      void Set_delete_criterion_param(float delete_param)
      {
          delete_criterion_param = delete_param;
 --- include/ikd-Tree/ikd_Tree.cpp
 +++ include/ikd-Tree/ikd_Tree.cpp
-@@ -219,6 +219,28 @@
+@@ -219,6 +219,24 @@
  }
  
  template <typename PointType>
-+// resple_bridge: await tree quiescence.
-+// Cover pending and active rebuilds.
-+// Use only at boundaries.
++// Await boundary quiescence.
 +void KD_TREE<PointType>::wait_for_pending_rebuild()
 +{
 +    while (true)
@@ -42,9 +40,7 @@ rebuilds to complete. Ordinary estimator batches retain upstream scheduling.
 +        {
 +            return;
 +        }
-+        // Yield to queued rebuilds.
-+        // Lock through active rebuilds.
-+        // Recheck pending state.
++        // Await pending rebuilds.
 +        usleep(100);
 +    }
 +}

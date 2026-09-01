@@ -11,20 +11,10 @@ __all__ = ["RespleOdometry", "config"]
 
 
 class RespleOdometry:
-    """Run one RESPLE session.
-
-    The upstream map is process-global, so each session needs a fresh process.
-    """
+    """Run one isolated RESPLE session."""
 
     def __init__(self, cfg: "config.RespleConfig", *, max_pending_sweeps: int = 8):
-        """`cfg` is the upstream RESPLE parameter set.
-
-        `max_pending_sweeps` is offline execution policy, not an upstream
-        parameter and not an estimator-quality knob: it bounds how many
-        accepted-but-unprocessed sweeps the producer may run ahead by, so a
-        fast producer cannot grow the queue without bound. It never changes
-        results.
-        """
+        """Configure upstream parameters and backpressure."""
         problems = cfg.validate()
         if problems:
             raise ValueError("invalid RespleConfig: " + "; ".join(problems))
@@ -51,22 +41,17 @@ class RespleOdometry:
 
     @property
     def lidar_names(self) -> tuple[str, ...]:
-        """Configured lidar names, in `lidars` order -- push_lidar's `lidar=`."""
+        """Return configured LiDAR names."""
         return tuple(lidar.name for lidar in self._cfg.lidars)
 
     def push_imu(self, timestamp: float, acceleration, angular_velocity) -> int:
-        """Push one IMU sample. Timestamps must be strictly increasing.
-
-        Raises ValueError in LiDAR-only mode (``if_lidar_only=True``):
-        upstream never drains its IMU buffer there, so samples pushed in that
-        mode would accumulate without ever reaching the estimator.
-        """
+        """Push one ordered IMU sample."""
         return self._native.push_imu(
             float(timestamp), list(map(float, acceleration)), list(map(float, angular_velocity))
         )
 
     def push_imu_batch(self, samples) -> int:
-        """Atomically commit a timestamp-ordered finite interval of IMU input."""
+        """Commit one ordered IMU interval."""
         rows = list(samples)
         return self._native.push_imu_batch(
             [float(row[0]) for row in rows],
@@ -84,25 +69,11 @@ class RespleOdometry:
         tags: np.ndarray | None = None,
         lidar: str | None = None,
     ) -> int:
-        """`points` is (N, 3) or (N, 4) [x, y, z, (intensity)]; `relative_times`
-        is (N,) seconds from the source packet header timestamp. Injection
-        begins at RESPLE's internal cloud buffer after applying the configured
-        upstream callback's profile-specific predicates.
+        """Push one profiled LiDAR sweep.
 
-        ``lines`` and ``tags`` carry the raw Livox packet fields. They may be
-        omitted for canonical inputs whose invalid driver points have already
-        been removed; direct bag replay should provide them.
-
-        ``lidar`` names the configured profile this sweep came from (see
-        :attr:`lidar_names`); it may be omitted only when the session has a
-        single LiDAR. With several, each one's sweeps must actually be pushed:
-        upstream forms a measurement batch only once *every* configured LiDAR
-        has buffered points, so a starved stream stalls the estimator rather
-        than degrading to the others.
-
-        Returns a globally monotonic ticket shared by every configured LiDAR.
-        Missing IMU or LiDAR lookahead never rejects an ordinary push; use
-        :meth:`synchronize` when a deterministic processed boundary is needed.
+        Points use XYZ or XYZI columns. Relative times use seconds. Raw Livox
+        input should include lines and tags. Multi-LiDAR sessions require the
+        profile name and input from every configured stream.
         """
         points = np.ascontiguousarray(points, dtype=np.float32)
         relative_times = np.ascontiguousarray(relative_times, dtype=np.float64)
@@ -116,14 +87,10 @@ class RespleOdometry:
         )
 
     def synchronize(self, ticket: int | None = None) -> bool:
-        """Drain currently supplied work to a deterministic boundary.
+        """Drain input to a stable boundary.
 
-        With a LiDAR ticket, returns true only when the complete global ticket
-        prefix through it has been processed. False means upstream is stably
-        blocked pending more IMU, LiDAR lookahead, or another configured LiDAR.
-        Without a ticket, synchronizes the current sensor-submission snapshot;
-        this is useful for committing the initialization IMU prefix before the
-        first sweep. The native wait releases the GIL.
+        False indicates missing sensor lookahead. Without a ticket, the current
+        submission snapshot defines the boundary.
         """
         return bool(self._native.synchronize(ticket))
 
@@ -132,7 +99,7 @@ class RespleOdometry:
         return self._native.trajectory()
 
     def latest_pose(self) -> np.ndarray | None:
-        """Return the most recent published pose snapshot without blocking."""
+        """Return the latest pose snapshot."""
         return self._native.latest_pose()
 
     def drain_map_batches(self) -> list[np.ndarray]:
@@ -148,11 +115,7 @@ class RespleOdometry:
         return self._native.status()
 
     def finish(self) -> dict:
-        """Close input, drain the worker, and return the finalized results.
-
-        There is no timeout: completion is a state condition. Metrics report
-        any accepted trailing tickets that upstream could not process.
-        """
+        """Close input and finalize results."""
         return self._native.finish()
 
     def __enter__(self) -> "RespleOdometry":
