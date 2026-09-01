@@ -1,7 +1,6 @@
 #pragma once
 
-// Included by RESPLE.cpp but never named in the RESPLE class (only Mapping.cpp
-// consumes Calib). Present for include compatibility only.
+// Satisfy the upstream include.
 
 #include "estimate_msgs/msg/knot.hpp"
 

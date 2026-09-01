@@ -1,9 +1,6 @@
 #pragma once
 
-// Compat CustomMsg matching the field names RESPLE.cpp's livoxLidarCallback
-// reads (Mid70Avia path). This bridge never drives data through it (see
-// cpp/bindings.cpp); it only needs to exist so that callback compiles, since
-// its address is taken in the RESPLE constructor.
+// Match required Livox fields.
 
 #include <cstdint>
 #include <memory>

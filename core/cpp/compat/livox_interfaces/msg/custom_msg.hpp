@@ -1,6 +1,6 @@
 #pragma once
 
-// See livox_ros_driver/msg/custom_msg.hpp (AviaResple path uses this namespace).
+// Alias the Avia message.
 
 #include <cstdint>
 #include <memory>

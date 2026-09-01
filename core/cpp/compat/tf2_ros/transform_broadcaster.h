@@ -1,8 +1,6 @@
 #pragma once
 
-// RESPLE.cpp constructs a TransformBroadcaster but never calls sendTransform
-// in the code path this bridge compiles (RESPLE class only, not Mapping.cpp).
-// No-op: broadcasting a tf frame has no offline consumer.
+// Provide the unused broadcaster.
 
 #include <memory>
 

@@ -1,12 +1,6 @@
 #pragma once
 
-// Minimal replacement for sensor_msgs/msg/point_cloud2.hpp, structurally
-// compatible with pcl_conversions::toPCL/fromROSMsg below. RESPLE.cpp never
-// actually receives one of these at runtime through this bridge (sweeps are
-// injected directly into RESPLE's per-lidar buffers instead, see
-// patches/integration/01-bridge-visibility.patch), but the Ouster/Hesai/
-// Mid360Boxi callback bodies must still compile since their addresses are
-// taken in the constructor.
+// Carry captured point clouds.
 
 #include <cstdint>
 #include <string>

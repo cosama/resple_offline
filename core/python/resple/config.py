@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, fields
 from typing import Any
 
-# Upstream keys its fused LiDAR configuration and buffers by type.
+# Types identify LiDAR buffers.
 _KNOWN_LIDAR_TYPES = {
     "AviaResple", "HAP360", "Hesai", "Mid360Boxi", "Mid70Avia", "Ouster"
 }
@@ -17,7 +17,7 @@ class LidarProfile:
     lidar_type: str
     scan_line: int
     blind: float
-    q_lb: tuple[float, float, float, float]  # (w, x, y, z)
+    q_lb: tuple[float, float, float, float]  # Quaternion uses WXYZ order.
     t_lb: tuple[float, float, float]
     topic_lidar: str = ""
     w_pt: float = 0.01
@@ -64,7 +64,7 @@ class RespleConfig:
     cov_bg: tuple[float, float, float] = (0.2, 0.2, 0.2)
     n_iter: int = 3
     num_points_upd: int = 100
-    acc_ratio: bool = False  # True if IMU linear_acceleration is in g, not m/s^2
+    acc_ratio: bool = False  # Acceleration may use gravity units.
     lidar_time_offset: float = 0.0
 
     def validate(self) -> list[str]:
@@ -111,12 +111,7 @@ class RespleConfig:
         return problems
 
     def native_parameters(self) -> dict[str, Any]:
-        """Exactly the keys/types RespleOdometry's `parameters` dict consumes.
-
-        Per-lidar keys (topic_lidar, lidar_type, scan_line, blind, q_lb, t_lb,
-        w_pt) and `lidars` itself are supplied separately by RespleOdometry's
-        constructor arguments, not through this dict -- see __init__.py.
-        """
+        """Return typed native parameters."""
         return {
             "topic_imu": self.topic_imu,
             "if_lidar_only": self.if_lidar_only,
@@ -146,7 +141,7 @@ class RespleConfig:
         }
 
     def report(self) -> dict[str, Any]:
-        """Requested config for the run manifest (ARCHITECTURE.md #7)."""
+        """Return the resolved configuration."""
         data = {f.name: getattr(self, f.name) for f in fields(self)}
         data["lidars"] = [
             {"name": lidar.name, **lidar.upstream_parameters()}
@@ -182,9 +177,12 @@ def normalize_overrides(payload: dict[str, Any] | None) -> dict[str, Any]:
         if isinstance(value, dict) and "ros__parameters" in value
     ]
     if envelopes:
-        if len(envelopes) != 1 or len(payload) != 1:
-            raise ValueError("RESPLE config must contain exactly one ROS2 parameter envelope")
-        envelope = payload[envelopes[0]]
+        if "/**" in envelopes:
+            envelope = payload["/**"]
+        elif len(envelopes) == 1:
+            envelope = payload[envelopes[0]]
+        else:
+            raise ValueError("RESPLE config has multiple matching ROS2 parameter envelopes")
         params = envelope["ros__parameters"]
         if not isinstance(params, dict):
             raise ValueError("ros__parameters must be a mapping")
@@ -213,16 +211,9 @@ def normalize_overrides(payload: dict[str, Any] | None) -> dict[str, Any]:
                 )
             profiles.append({"name": name, **profile})
         result["lidars"] = profiles
-        # Upstream silently ignores profile mappings omitted from `lidars`.
-        stray = sorted(
-            key for key, value in result.items()
-            if isinstance(value, dict) and key != "lidars"
-        )
-        if stray:
-            raise ValueError(
-                f"lidar profile(s) {stray} are defined but not listed in "
-                f"lidars: {list(lidars_raw)}; remove them or add them to the list"
-            )
+        ignored = [key for key, value in result.items() if isinstance(value, dict)]
+        for key in ignored:
+            result.pop(key)
     return result
 
 
@@ -245,7 +236,7 @@ def resolve(overrides: dict[str, Any] | None = None) -> RespleConfig:
             blind=float(entry.get("blind", 0.5)),
             q_lb=tuple(entry.get("q_lb", (1.0, 0.0, 0.0, 0.0))),
             t_lb=tuple(entry.get("t_lb", (0.0, 0.0, 0.0))),
-            # Keep reports, emitted YAML, and native parameters consistent.
+            # Supply stable offline topics.
             topic_lidar=str(entry.get("topic_lidar") or f"/offline/{entry['name']}"),
             w_pt=float(entry.get("w_pt", 0.01)),
         )
@@ -253,7 +244,7 @@ def resolve(overrides: dict[str, Any] | None = None) -> RespleConfig:
     )
     if not overrides.get("topic_imu"):
         overrides["topic_imu"] = "/offline/imu"
-    # YAML supplies lists; keep the frozen dataclass hashable and round-trippable.
+    # Preserve immutable vector fields.
     for key in ("cov_acc", "cov_gyro", "cov_ba", "cov_bg"):
         value = overrides.get(key)
         if isinstance(value, (list, tuple)):

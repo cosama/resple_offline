@@ -1,6 +1,6 @@
 #pragma once
 
-// See livox_ros_driver/msg/custom_msg.hpp (HAP360 path uses this namespace).
+// Alias the HAP360 message.
 
 #include <cstdint>
 #include <memory>

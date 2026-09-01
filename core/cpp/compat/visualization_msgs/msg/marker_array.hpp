@@ -1,7 +1,6 @@
 #pragma once
 
-// RESPLE.cpp includes this but never names visualization_msgs::msg::MarkerArray.
-// Present for include compatibility only.
+// Satisfy the upstream include.
 
 namespace visualization_msgs {
 namespace msg {

@@ -1,8 +1,6 @@
 #pragma once
 
-// RESPLE.cpp includes <std_srvs/srv/empty.hpp> and <rclcpp/service.hpp> but
-// registers no service in the offline-relevant (RESPLE class) code path.
-// Present for include compatibility only.
+// Satisfy the upstream include.
 
 namespace std_srvs {
 namespace srv {

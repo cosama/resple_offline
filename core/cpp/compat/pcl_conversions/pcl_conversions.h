@@ -1,13 +1,6 @@
 #pragma once
 
-// Minimal replacement for pcl_conversions/pcl_conversions.h.
-//
-// Needed only so the Ouster/Hesai/Mid360Boxi PointCloud2 callback bodies in
-// (patched, staged) RESPLE.cpp compile -- their addresses are taken in the
-// RESPLE constructor even though this bridge never drives sensor data
-// through them (it injects directly into RESPLE's per-lidar buffers; see
-// patches/integration/01-bridge-visibility.patch and cpp/bindings.cpp).
-// fromROSMsg therefore only needs to be well-typed, not exercised.
+// Convert captured point clouds.
 
 #include <pcl/PCLPointCloud2.h>
 #include <pcl/conversions.h>

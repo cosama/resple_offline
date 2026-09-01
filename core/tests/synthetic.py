@@ -31,7 +31,7 @@ def box_room_sweep(position: np.ndarray, n_azimuth: int = 360, n_rings: int = 16
     return points, relative_times
 
 
-# RESPLE's gravity initialization averages its first 15 IMU samples.
+# Supply the gravity prefix.
 IMU_LEAD_SECONDS = 0.1
 
 
@@ -67,10 +67,7 @@ def run_stationary_session(odom, duration: float = 1.5, imu_hz: float = 200.0,
     return odom.finish()
 
 
-# Body-frame position of the second LiDAR in the multi-lidar scene. Upstream's
-# LidarConfig computes q_bl = q_lb^-1 and t_bl = q_lb^-1 * (-t_lb), and
-# Association::pointBodyToWorld applies p_body = q_bl * p_lidar + t_bl -- so
-# with an identity q_lb, t_lb is the negated body-frame offset of the sensor.
+# Offset the second LiDAR.
 SECOND_LIDAR_OFFSET = np.array([0.3, -0.2, 0.1])
 
 
@@ -94,7 +91,7 @@ def run_stationary_multi_lidar_session(odom, duration: float = 1.5, imu_hz: floa
     """
     assert imu_hz * IMU_LEAD_SECONDS >= 15, "first sweep would race gravity initialization"
     first, second = odom.lidar_names
-    # (name, sensor position in the body frame, next release time)
+    # Track each sensor schedule.
     streams = [[first, np.zeros(3), 0.0], [second, SECOND_LIDAR_OFFSET, 0.5 / lidar_hz]]
     sweep_index = 0
     unresolved = deque()

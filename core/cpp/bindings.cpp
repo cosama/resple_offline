@@ -1,7 +1,4 @@
-// Offline host for the pinned upstream RESPLE estimator. It injects prepared
-// sensor data into RESPLE's internal buffers and captures compat publishers.
-// The staged, patched RESPLE.cpp is included directly so its process-global
-// state remains in one translation unit. See CMakeLists.txt and offline_bridge.hpp.
+// Host the upstream estimator.
 
 #include <resple_bridge/offline_bridge.hpp>
 
@@ -26,7 +23,13 @@
 #include <thread>
 #include <vector>
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wreorder"
+#pragma GCC diagnostic ignored "-Wsign-compare"
+#pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+#pragma GCC diagnostic ignored "-Wunused-variable"
 #include "RESPLE.cpp"
+#pragma GCC diagnostic pop
 
 namespace py = pybind11;
 
@@ -66,7 +69,7 @@ void advance_completed_prefix(SynchronizationState& state) {
         !found->second.raw_ingested || found->second.pending_points != 0)
       return;
     ++state.completed_prefix;
-    // Completed tickets are never queried individually again.
+    // Discard completed ticket state.
     state.tickets.erase(found);
   }
 }
@@ -75,8 +78,7 @@ std::atomic<bool>& input_closed_flag() {
   static std::atomic<bool> flag{false};
   return flag;
 }
-// Updated under progress_mutex() so the condition-variable predicate and
-// notification cannot race into a lost wakeup.
+// Guard progress notifications.
 std::atomic<std::uint64_t>& progress_epoch() {
   static std::atomic<std::uint64_t> value{0};
   return value;
@@ -176,7 +178,7 @@ void release_lidar_ticket(std::uint64_t ticket) noexcept {
     std::lock_guard<std::mutex> lock(state.mutex);
     const auto found = state.tickets.find(ticket);
     if (found == state.tickets.end() || found->second.committed) return;
-    // Retire in place so the contiguous prefix can cross this unused number.
+    // Retire unused ticket numbers.
     found->second.committed = true;
     found->second.raw_ingested = true;
     found->second.pending_points = 0;
@@ -228,9 +230,7 @@ void wait_for_synchronization_release(std::uint64_t submission_epoch) noexcept {
   if (state.request_generation == state.completed_request_generation ||
       submission_epoch < state.requested_epoch)
     return;
-  // Capture the generation represented by this stable pass. A subsequent
-  // Python call may publish the next request before this worker wakes from the
-  // completed request; it must not retroactively keep the old pass parked.
+  // Preserve this handoff generation.
   const std::uint64_t handed_off_generation = state.request_generation;
   state.condition.wait(lock, [&] {
     return state.completed_request_generation >= handed_off_generation ||
@@ -293,14 +293,13 @@ void ticket_snapshot(std::uint64_t& latest, std::uint64_t& completed,
   std::lock_guard<std::mutex> lock(state.mutex);
   latest = state.latest_committed_ticket;
   completed = state.completed_prefix;
-  // Saturating: a trailing released reservation (see release_lidar_ticket)
-  // advances the prefix past the last committed ticket.
+  // Exclude released trailing reservations.
   incomplete = latest > completed ? static_cast<std::size_t>(latest - completed) : 0;
 }
 
 void close_input() noexcept {
   input_closed_flag().store(true, std::memory_order_release);
-  note_progress();  // release a producer parked in await_progress()
+  note_progress();  // Release waiting producers.
 }
 
 std::uint64_t current_progress_epoch() noexcept {
@@ -345,7 +344,7 @@ struct Recorder {
   std::int64_t lidar_sweeps_pushed = 0;
   std::int64_t lidar_points_after_preprocessing = 0;
   std::int64_t map_batches_emitted = 0;
-  // Filled after the worker joins; upstream may leave a partial trailing batch.
+  // Record unprocessed trailing input.
   std::int64_t residual_sweeps = 0;
   std::int64_t residual_points = 0;
 
@@ -361,18 +360,7 @@ std::int64_t seconds_to_ns(double seconds) {
   return static_cast<std::int64_t>(std::llround(seconds * 1e9));
 }
 
-// The window of a spline over which a sampled pose is meaningful.
-//
-// Both ends of [minTimeNs(), maxTimeNs()] are excluded:
-//   - minTimeNs() sits one knot interval *before* the first real knot while
-//     the spline still carries its leading idle knots, so poses there are
-//     backward extrapolation into the pre-initialization region.
-//   - the final interval is forward propagation only: collectMeasurements()
-//     will not form a batch until data exists beyond maxTimeNs() + dt_ns, so
-//     at end of input the last interval never receives a measurement update.
-//     This is also why upstream's own live publication trails the leading
-//     edge by one knot.
-// A cubic B-spline needs 4 control points before any of it is meaningful.
+// Exclude unrefined spline intervals.
 bool spline_pose_window(const SplineState* spline, std::int64_t& first_ns,
                         std::int64_t& last_ns) {
   if (!spline || spline->numKnots() < 4) return false;
@@ -381,12 +369,7 @@ bool spline_pose_window(const SplineState* spline, std::int64_t& first_ns,
   return last_ns >= first_ns;
 }
 
-// Every RESPLE parameter is set with its exact upstream C++ type
-// (CommonUtils::readParam<T> is type-strict: std::any_cast<T> fails silently
-// to "not present" for a mismatched type, e.g. double where float is read).
-// A generic py::dict type-sniffing loop would risk exactly that mismatch, so
-// every key is named and cast to a fixed type here (ARCHITECTURE.md #7: plumb
-// every behavior-affecting option deliberately).
+// Preserve upstream parameter types.
 struct LidarSpec {
   std::string name;
   std::string topic_lidar;
@@ -434,11 +417,7 @@ void configure_lidar(rclcpp::Node::SharedPtr& node, const LidarSpec& spec) {
   node->set_parameter<double>(prefix + "w_pt", spec.w_pt);
 }
 
-// Upstream keys both `lidars` and `lidars_data` by lidar *type*, and each raw
-// sensor callback carries its own function-local `static int64_t last_t_ns`
-// (one callback per type). So per-type is exactly upstream's own granularity
-// for the cross-frame timestamp filter and the sweep buffers reproduced in
-// push_lidar -- which is also why two profiles of the same type are refused.
+// Mirror per-type upstream state.
 struct LidarStream {
   std::string type;
   int scan_line = 1;
@@ -493,7 +472,7 @@ class RespleOdometry {
     resple_ = std::make_unique<RESPLE>(node_);
     if (resple_->point_filter_num < 1)
       throw py::value_error("point_filter_num must be at least 1");
-    install_captures();  // captures resple_.get(); must run after construction
+    install_captures();  // Requires constructed estimator.
     start_worker();
   }
 
@@ -501,18 +480,14 @@ class RespleOdometry {
     try {
       shutdown();
     } catch (...) {
-      // A destructor must not propagate. Any worker failure has already been
-      // surfaced by finish()/push_*; all this can lose is a join() error.
+      // Destructors cannot report failures.
     }
   }
 
   std::int64_t push_imu(double timestamp, const std::vector<double>& acceleration,
                         const std::vector<double>& angular_velocity) {
     throw_if_failed();
-    // In LiDAR-only mode processData() never drains imu_int_buff (upstream's
-    // `if (!if_lidar_only && !imu_int_buff.empty())`), so anything pushed here
-    // would grow without bound and never reach the estimator. Refuse rather
-    // than accumulate silently.
+    // Prevent unused IMU buffering.
     if (resple_->if_lidar_only)
       throw py::value_error(
           "push_imu is not valid in LiDAR-only mode (if_lidar_only=true): "
@@ -533,10 +508,7 @@ class RespleOdometry {
     message->angular_velocity.y = angular_velocity[1];
     message->angular_velocity.z = angular_velocity[2];
 
-    // Linearize close, validation, enqueue, and the submission epoch. The
-    // worker may consume the message before note_imu_submission(), but a pass
-    // that did so necessarily publishes a snapshot older than this commit;
-    // synchronize() will wait for its next stable-blocked pass.
+    // Commit samples and epochs atomically.
     {
       std::lock_guard<std::mutex> input_lock(input_mutex_);
       throw_if_input_closed();
@@ -595,8 +567,7 @@ class RespleOdometry {
     {
       std::lock_guard<std::mutex> input_lock(input_mutex_);
       throw_if_input_closed();
-      // Commit one timestamp-defined producer interval atomically. The worker
-      // sees either none or all of it, never a scheduler-dependent prefix.
+      // Commit complete IMU intervals.
       std::lock_guard<std::mutex> lock(resple_->m_buff);
       resple_->imu_int_buff.insert(
           resple_->imu_int_buff.end(), messages.begin(), messages.end());
@@ -640,17 +611,11 @@ class RespleOdometry {
     const py::ssize_t count = points.shape(0);
     const float blind = resple_->lidars.at(stream.type).blind;
     const float blind2 = blind * blind;
-    // Upstream's per-frame `static int64_t last_t_ns = time_begin;` -- on the
-    // first frame the cross-frame filter below compares against that frame's
-    // own start, so a point at exactly offset 0 is dropped there too. The
-    // static lives in the per-type callback, hence per-stream here.
+    // Initialize cross-frame filtering state.
     if (stream.last_absolute_point_stamp_ns == std::numeric_limits<std::int64_t>::min())
       stream.last_absolute_point_stamp_ns = time_begin_ns;
 
-    // Reproduce the configured upstream callback at the internal-buffer
-    // boundary. Canonical inputs may omit Livox line/tag after driver-level
-    // invalid points have already been removed; raw bag injection supplies
-    // them and therefore exercises the complete callback predicate.
+    // Match upstream callback filtering.
     Eigen::aligned_vector<pcl::PointXYZINormal> cloud;
     cloud.reserve(static_cast<std::size_t>(count));
     std::int64_t max_kept_offset_ns = 0;
@@ -673,8 +638,7 @@ class RespleOdometry {
         const bool driver_valid = line < stream.scan_line &&
             (((tag & 0x30) == 0x10) || ((tag & 0x30) == 0x00));
         if (!driver_valid) continue;
-        // AviaResple places the cross-frame timestamp predicate before the
-        // valid-point counter; Mid70Avia/HAP360 place it in the final gate.
+        // Preserve profile-specific predicate order.
         if (avia_resple && time_begin_ns + raw_offset_ns <= stream.last_absolute_point_stamp_ns)
           continue;
         ++valid_point_num;
@@ -695,8 +659,7 @@ class RespleOdometry {
       const bool keep = offset_ms >= 0.0f && !duplicate &&
                         x * x + y * y + z * z > blind2 && time_valid;
       if (livox_custom) {
-        // Upstream updates pt_pre after every strided candidate, even when
-        // blind/timestamp filtering rejects that candidate.
+        // Preserve candidate duplicate state.
         previous_x = x;
         previous_y = y;
         previous_z = z;
@@ -715,14 +678,11 @@ class RespleOdometry {
     {
       std::lock_guard<std::mutex> input_lock(input_mutex_);
       throw_if_input_closed();
-      // Recheck after the GIL-released backpressure wait so concurrent callers
-      // cannot enqueue a per-stream timestamp inversion.
+      // Recheck after unlocked waiting.
       if (timestamp <= stream.last_stamp)
         throw py::value_error("sweep timestamps must be strictly increasing per lidar");
       const std::uint64_t ticket = resple_bridge::reserve_lidar_ticket();
-      // The enqueue below can still throw (an allocation, in practice). A
-      // reserved-but-uncommitted ticket blocks the completed prefix forever,
-      // so give it back on the way out and let the original failure surface.
+      // Retire failed ticket reservations.
       struct Reservation {
         std::uint64_t ticket;
         bool committed = false;
@@ -772,35 +732,26 @@ class RespleOdometry {
     std::uint64_t completed_prefix = 0;
     {
       py::gil_scoped_release release;
-      // Serialize explicit boundaries without making a second Python caller
-      // hold the GIL while waiting for the first one to return.
+      // Serialize explicit boundaries.
       std::unique_lock<std::mutex> synchronize_lock(synchronize_mutex_);
       const std::uint64_t request_generation =
           resple_bridge::request_synchronization(target_epoch);
       reached_stable = resple_bridge::wait_for_stable_blocked(target_epoch);
-      // A stable-blocked publication precedes this lock. Holding the pass
-      // mutex prevents new estimator/map work while the explicit tree barrier
-      // establishes the deterministic boundary.
+      // Hold estimator work quiescent.
       std::lock_guard<std::mutex> processing_lock(resple_->bridge_processing_mutex);
       ikdtree.wait_for_pending_rebuild();
-      // Sampled here, while the worker is still excluded and before the
-      // handoff below releases it. Read after complete_synchronization it
-      // would describe whatever the resumed worker had reached by then --
-      // a later instant than the boundary this call exists to establish.
+      // Sample the requested boundary.
       completed_prefix = resple_bridge::completed_ticket_prefix();
       resple_bridge::complete_synchronization(request_generation);
     }
     throw_if_failed();
     if (!reached_stable) return false;
-    // An IMU-only snapshot has no LiDAR ticket and is complete once absorbed.
-    // Otherwise the no-argument form covers every LiDAR committed at entry.
+    // Accept absorbed IMU-only snapshots.
     return target_ticket == 0 || completed_prefix >= target_ticket;
   }
 
   py::dict finish() {
-    // No timeout parameter on purpose: completion is a state condition, and a
-    // wall-clock deadline could only truncate a still-progressing replay,
-    // which is exactly the nondeterminism this bridge exists to avoid.
+    // Wait for state completion.
     {
       py::gil_scoped_release release;
       shutdown();
@@ -901,8 +852,7 @@ class RespleOdometry {
   }
 
  private:
-  // The three ticket counters, read together so a caller never sees a triple
-  // that does not add up (the worker advances between separate reads).
+  // Snapshot ticket counters together.
   static void add_ticket_counters(py::dict& result) {
     std::uint64_t latest = 0, completed = 0;
     std::size_t incomplete = 0;
@@ -912,9 +862,7 @@ class RespleOdometry {
     result["incomplete_tickets"] = static_cast<std::int64_t>(incomplete);
   }
 
-  // Producer-side counters, so a rig whose second lidar is silently never fed
-  // (which stalls upstream's collectMeasurements: it requires every lidar's
-  // pt_buff to be non-empty) is visible rather than merely slow.
+  // Expose stalled LiDAR streams.
   py::dict per_lidar() const {
     py::dict result;
     for (const auto& [name, stream] : streams_) {
@@ -928,9 +876,7 @@ class RespleOdometry {
     return result;
   }
 
-  // Resolves push_lidar's `lidar=` argument. An empty name is the
-  // single-lidar shorthand; with a rig it is ambiguous rather than defaulted,
-  // because silently feeding one lidar of several is what stalls the worker.
+  // Resolve explicit LiDAR streams.
   LidarStream& select_stream(const std::string& name) {
     if (name.empty()) {
       if (streams_.size() != 1)
@@ -976,8 +922,7 @@ class RespleOdometry {
       } else if (key == "cov_acc" || key == "cov_gyro" || key == "cov_ba" || key == "cov_bg") {
         node_->set_parameter<std::vector<double>>(key, py::cast<std::vector<double>>(value));
       } else if (py::isinstance<py::float_>(value) || py::isinstance<py::int_>(value)) {
-        // nn_thresh, coeff_cov, cube_len, cov_P0, cov_RCP_*, std_sys_*,
-        // lidar_time_offset -- all plain doubles upstream.
+        // Preserve upstream double parameters.
         node_->set_parameter<double>(key, py::cast<double>(value));
       } else {
         throw py::type_error("unrecognized RESPLE native parameter: " + key);
@@ -993,8 +938,7 @@ class RespleOdometry {
           state.events.push_back(Event{"init", ns_to_seconds(msg.data)});
         };
 
-    // Live samples are useful before finish(). finish() replaces this vector
-    // by sampling the fully drained, finalized spline.
+    // Capture provisional live poses.
     RESPLE* resple_ptr = resple_.get();
     rclcpp::Publisher<estimate_msgs::msg::Estimate>::capture_slot() =
         [resple_ptr](const estimate_msgs::msg::Estimate&) {
@@ -1036,8 +980,7 @@ class RespleOdometry {
       }
       worker_finished_.store(true, std::memory_order_release);
       resple_bridge::note_worker_finished();
-      // Unblocks a producer parked in apply_backpressure() on a worker that
-      // has stopped; it rechecks worker_finished_ and raises.
+      // Release blocked producers.
       resple_bridge::note_progress();
     });
   }
@@ -1048,18 +991,14 @@ class RespleOdometry {
       std::lock_guard<std::mutex> input_lock(input_mutex_);
       resple_bridge::close_input();
     }
-    // join() is the state wait: processData returns only after a pass that
-    // began with input closed and made no progress. Keep ownership until
-    // then; this worker captures `this` and must never be detached.
+    // Retain worker ownership.
     worker_.join();
-    // finish is the closing synchronization boundary. No worker can schedule
-    // another rebuild after join, so this covers the final asynchronous job.
+    // Quiesce final tree rebuilds.
     ikdtree.wait_for_pending_rebuild();
     record_residual_buffers();
   }
 
-  // Only safe once the worker is joined: pt_buff is worker-owned and has no
-  // mutex of its own.
+  // Requires a joined worker.
   void record_residual_buffers() {
     std::int64_t sweeps = 0, points = 0;
     for (const auto& entry : resple_->lidars_data) {
@@ -1085,8 +1024,7 @@ class RespleOdometry {
 
   void apply_backpressure(const LidarStream& stream) {
     RESPLE::LidarData& buffers = resple_->lidars_data.at(stream.type);
-    // Snapshot the epoch *before* reading the queue depth: a dequeue landing
-    // between the two only makes the wait return immediately.
+    // Snapshot progress before depth.
     std::uint64_t epoch = resple_bridge::current_progress_epoch();
     while (true) {
       std::size_t pending;
@@ -1111,8 +1049,7 @@ class RespleOdometry {
     if (relative_times.ndim() != 1 || relative_times.shape(0) != points.shape(0))
       throw py::value_error("relative_times must have shape (N,)");
     if (!std::isfinite(timestamp)) throw py::value_error("sweep timestamp must be finite");
-    // Per stream: separate lidars are independent sensors whose sweeps
-    // interleave in any order, exactly as their ROS subscriptions would.
+    // Validate timestamps per stream.
     if (timestamp <= stream.last_stamp)
       throw py::value_error("sweep timestamps must be strictly increasing per lidar");
 
@@ -1132,10 +1069,7 @@ class RespleOdometry {
     }
   }
 
-  // Replaces the live samples with a uniform resampling of the finalized
-  // spline, once the worker has drained and joined. Publication timing is not
-  // authoritative for a spline estimator -- knots keep being refined after the
-  // control point that produced them was published.
+  // Sample the finalized spline.
   void sample_finalized_trajectory() {
     auto& state = recorder();
     std::lock_guard<std::mutex> lock(state.mutex);
@@ -1167,8 +1101,7 @@ class RespleOdometry {
     return out;
   }
 
-  // Keyed by the `lidars` config name -- the identity the Python API uses.
-  // One entry per lidar *type*; see LidarStream.
+  // Key streams by profile.
   std::map<std::string, LidarStream> streams_;
   int max_pending_sweeps_;
   rclcpp::Node::SharedPtr node_;
@@ -1181,8 +1114,7 @@ class RespleOdometry {
   std::exception_ptr worker_error_;
   std::int64_t imu_pushed_ = 0;
   double last_imu_stamp_ = -std::numeric_limits<double>::infinity();
-  // Max over all lidars; -inf until the first sweep of any of them is
-  // accepted. Per-lidar monotonicity lives in LidarStream::last_stamp.
+  // Track the latest sweep.
   double last_lidar_stamp_ = -std::numeric_limits<double>::infinity();
 };
 

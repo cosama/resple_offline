@@ -1,7 +1,6 @@
 #pragma once
 
-// RESPLE.cpp includes this but never names nav_msgs::msg::Path in the RESPLE
-// class. Present for include compatibility only.
+// Satisfy the upstream include.
 
 #include <vector>
 

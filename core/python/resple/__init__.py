@@ -31,7 +31,6 @@ class RespleOdometry:
         if int(max_pending_sweeps) < 1:
             raise ValueError("max_pending_sweeps must be at least 1")
         self._cfg = cfg
-        self._max_pending_sweeps = int(max_pending_sweeps)
         self._native = _RespleOdometry(
             parameters=cfg.native_parameters(),
             lidars=[
@@ -47,7 +46,7 @@ class RespleOdometry:
                 }
                 for lidar in cfg.lidars
             ],
-            max_pending_sweeps=self._max_pending_sweeps,
+            max_pending_sweeps=int(max_pending_sweeps),
         )
 
     @property
@@ -162,3 +161,8 @@ class RespleOdometry:
     def __exit__(self, exc_type, exc, tb) -> None:
         if exc_type is None:
             self.finish()
+            return
+        try:
+            self.finish()
+        except Exception:
+            pass

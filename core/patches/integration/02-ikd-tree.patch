@@ -1,28 +1,7 @@
-include/ikd-Tree/{ikd_Tree.h,ikd_Tree.cpp} -- the vendored ikd-tree.
+Expose tree rebuild quiescence.
 
-One patch per upstream file; the declaration and its definition are one
-change and neither compiles without the other, so both files are here.
-
-The pinned RESPLE ikd-tree is the same lineage/version as DALI-SLAM's. Its
-background subtree rebuild may otherwise remain active across an externally
-observable processing boundary. Expose a quiescence barrier, invoked only by
-the bridge's explicit `synchronize()` and closing `finish()` paths after they
-exclude the estimator worker with `bridge_processing_mutex`, and initialize
-pthread_t so the existing conditional join is defined if thread creation
-fails.
-
-The barrier also covers a rebuild queued in Rebuild_Ptr before the background
-worker acquires rebuild_ptr_mutex_lock. The estimator thread is the only
-rebuild scheduler at this boundary, so no new job can be queued while it waits.
-
-Scope: the barrier makes the tree quiescent at explicit host synchronization
-and finish boundaries; it is deliberately not paid at every estimator batch.
-Deterministic stepwise replay calls `synchronize()` between LiDAR submissions,
-so the next batch starts from a quiescent tree. Free-running clients that do
-not place those boundaries retain upstream's normal rebuild scheduling. Tree
-contents stay consistent regardless -- Rebuild_Logger replays operations that
-land during a rebuild. The barrier also does not alter Add_Points' internal
-downsample searches within one mapIncremental() call.
+Explicit synchronization and finish boundaries require pending asynchronous
+rebuilds to complete. Ordinary estimator batches retain upstream scheduling.
 
 --- include/ikd-Tree/ikd_Tree.h
 +++ include/ikd-Tree/ikd_Tree.h
@@ -39,7 +18,7 @@ downsample searches within one mapIncremental() call.
  public:
      KD_TREE(float delete_param = 0.5, float balance_param = 0.6, float box_length = 0.2);
      ~KD_TREE();
-+    void wait_for_pending_rebuild();  // resple_bridge: see ikd_Tree.cpp
++    void wait_for_pending_rebuild();  // resple_bridge: await tree quiescence
      void Set_delete_criterion_param(float delete_param)
      {
          delete_criterion_param = delete_param;
@@ -49,9 +28,9 @@ downsample searches within one mapIncremental() call.
  }
  
  template <typename PointType>
-+// resple_bridge: quiescence barrier for the offline bridge -- blocks until no
-+// background subtree rebuild is pending or in flight at an explicit host
-+// synchronization/finish boundary. Ordinary estimator batches do not call it.
++// resple_bridge: await tree quiescence.
++// Cover pending and active rebuilds.
++// Use only at boundaries.
 +void KD_TREE<PointType>::wait_for_pending_rebuild()
 +{
 +    while (true)
@@ -63,9 +42,9 @@ downsample searches within one mapIncremental() call.
 +        {
 +            return;
 +        }
-+        // The rebuild worker polls on this interval. Yielding here lets a
-+        // queued job acquire the mutex; the next lock then blocks through
-+        // the active rebuild and rechecks its state.
++        // Yield to queued rebuilds.
++        // Lock through active rebuilds.
++        // Recheck pending state.
 +        usleep(100);
 +    }
 +}

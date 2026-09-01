@@ -1,15 +1,12 @@
 #pragma once
 
-// Minimal replacement for rclcpp/time.hpp. RESPLE.cpp only ever constructs
-// rclcpp::Time from a nanosecond count or a header stamp and reads it back as
-// nanoseconds/seconds or via operator-, so this holds a plain int64 count.
+// Store nanosecond timestamps.
 
 #include <cstdint>
 
 #include "builtin_interfaces/msg/time.hpp"
 
-// Real rclcpp pulls this enum in from the underlying rcl C library, i.e. at
-// global scope (RESPLE.cpp uses it unqualified: `rcl_clock_type_t::RCL_ROS_TIME`).
+// Match the global clock type.
 enum rcl_clock_type_t { RCL_ROS_TIME = 0, RCL_SYSTEM_TIME = 1, RCL_STEADY_TIME = 2 };
 
 namespace rclcpp {

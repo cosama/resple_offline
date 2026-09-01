@@ -8,12 +8,11 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common io kdtree filters)
-find_package(OpenMP)
+find_package(OpenMP REQUIRED)
 set(PYBIND11_FINDPYTHON ON)
 find_package(pybind11 CONFIG REQUIRED)
 
-# Pinned upstream + auditable patch series
-# Apply checked-in patches to a build-tree copy, leaving the submodule pristine.
+# Keep upstream pristine.
 get_filename_component(RESPLE_BRIDGE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 set(UPSTREAM_RESPLE "${RESPLE_BRIDGE_ROOT}/upstream/RESPLE/resple")
 if(NOT EXISTS "${UPSTREAM_RESPLE}/src/RESPLE.cpp")
@@ -39,7 +38,7 @@ endif()
 
 foreach(patch_file IN LISTS RESPLE_INTEGRATION_PATCHES)
   execute_process(
-    # Reject upstream drift instead of relocating mismatched hunks with fuzz.
+    # Reject upstream drift.
     COMMAND "${PATCH_EXECUTABLE}" -F0 --silent --no-backup-if-mismatch -p0 -i "${patch_file}"
     WORKING_DIRECTORY "${RESPLE_STAGE}"
     RESULT_VARIABLE patch_result
@@ -53,23 +52,19 @@ foreach(patch_file IN LISTS RESPLE_INTEGRATION_PATCHES)
 endforeach()
 message(STATUS "RESPLE: applied ${RESPLE_PATCH_COUNT} patches to staged upstream")
 
-# Native module
-# bindings.cpp includes RESPLE.cpp because upstream defines process-global
-# state in its headers; keeping it in one translation unit avoids ODR violations.
+# Keep globals together.
 pybind11_add_module(_core NO_EXTRAS
   cpp/bindings.cpp
   "${RESPLE_STAGE}/include/ikd-Tree/ikd_Tree.cpp"
 )
 
-set_source_files_properties(cpp/bindings.cpp PROPERTIES
-  COMPILE_OPTIONS "-Wno-unused-variable;-Wno-unused-but-set-variable;-Wno-sign-compare;-Wno-reorder")
 set_source_files_properties("${RESPLE_STAGE}/include/ikd-Tree/ikd_Tree.cpp" PROPERTIES
   COMPILE_OPTIONS "-Wno-unused-variable;-Wno-unused-but-set-variable;-Wno-sign-compare;-Wno-maybe-uninitialized")
 
 target_include_directories(_core PRIVATE
-  cpp/compat                      # shadows rclcpp/sensor_msgs/.../pcl_conversions
-  cpp/include                     # bridge ABI (resple_bridge/offline_bridge.hpp)
-  "${RESPLE_STAGE}/include"       # Estimator.h, SplineState.h, Association.h, utils/, ikd-Tree/
+  cpp/compat
+  cpp/include
+  "${RESPLE_STAGE}/include"
   "${RESPLE_STAGE}/src"
   ${PCL_INCLUDE_DIRS}
 )
@@ -80,9 +75,6 @@ target_compile_definitions(_core PRIVATE
 )
 target_compile_options(_core PRIVATE -O3 -Wall)
 
-target_link_libraries(_core PRIVATE Eigen3::Eigen ${PCL_LIBRARIES})
-if(OpenMP_CXX_FOUND)
-  target_link_libraries(_core PRIVATE OpenMP::OpenMP_CXX)
-endif()
+target_link_libraries(_core PRIVATE Eigen3::Eigen ${PCL_LIBRARIES} OpenMP::OpenMP_CXX)
 
 install(TARGETS _core LIBRARY DESTINATION resple)

@@ -38,8 +38,7 @@ _SESSION_SCRIPT = textwrap.dedent("""
     print("POSES", traj.shape[0])
     print("FINITE", bool(np.isfinite(traj).all()))
     print("RESIDUAL", metrics["residual_sweeps"], metrics["residual_points"])
-    # Bit-exact over the whole trajectory, not just its last row: a scheduling
-    # difference early in the run can be re-absorbed by later knots.
+    # Compare the complete trajectory.
     print("TRAJ", hashlib.sha256(traj.tobytes()).hexdigest())
 """)
 
@@ -132,8 +131,7 @@ _TICKET_HOLE_SCRIPT = textwrap.dedent("""
     assert odom.synchronize()
     points, times = box_room_sweep(np.zeros(3), seed=0)
     first = odom.push_lidar(0.0, points, times, lidar="front")
-    # This later ticket is fully filtered and finishes raw ingestion, but the
-    # public prefix must retain the hole at ticket 1.
+    # Preserve earlier ticket gaps.
     empty = odom.push_lidar(
         0.0, np.asarray([[0.01, 0.0, 0.0]], np.float32),
         np.asarray([0.0], np.float64), lidar="side",
@@ -253,10 +251,7 @@ def test_fully_filtered_sweep_completes_at_raw_ingestion():
     assert lines["INCOMPLETE"] == "0"
 
 
-# `max_pending_sweeps=1` with no synchronize() at all, so nearly every
-# push_lidar parks in the producer backpressure wait and is released only by the
-# worker's next dequeue. That wait is the one place a lost notification hangs
-# the process outright, and nothing else in this suite reaches it.
+# Exercise producer backpressure notifications.
 _BACKPRESSURE_SCRIPT = textwrap.dedent("""
     import numpy as np
     from resple import RespleOdometry, config as cfgmod
@@ -317,8 +312,7 @@ def test_imu_batch_commits_complete_interval_and_synchronizes():
     assert lines["FINISH"] == "20"
 
 
-# Two LiDARs of *different* types: upstream keys `lidars`/`lidars_data` by
-# type, so that is also the granularity at which a rig can be described.
+# Configure distinct LiDAR types.
 _MULTI_LIDAR_SCRIPT = textwrap.dedent("""
     import hashlib
     import json
@@ -342,9 +336,7 @@ _MULTI_LIDAR_SCRIPT = textwrap.dedent("""
     print("POSES", traj.shape[0])
     print("FINITE", bool(np.isfinite(traj).all()))
     print("RESIDUAL", metrics["residual_sweeps"])
-    # The sensor is stationary at the body origin for the whole scene, so a
-    # rig whose second LiDAR's extrinsics were ignored would drag the estimate
-    # off origin rather than merely look different.
+    # Extrinsics preserve the stationary origin.
     print("MAXDIST", float(np.abs(traj[:, 1:4]).max()))
     print("PERLIDAR", json.dumps({
         name: entry["sweeps_pushed"] for name, entry in metrics["per_lidar"].items()
@@ -382,13 +374,12 @@ def test_two_lidars_fuse_into_one_trajectory():
     assert int(lines["POSES"]) > 0, "expected at least one committed pose"
     assert lines["FINITE"] == "True"
     assert lines["RESIDUAL"] == "0", "worker stopped with sweeps still buffered"
-    # Both streams reached the estimator; a starved one stalls it silently.
+    # Require both input streams.
     import json as _json
     per_lidar = _json.loads(lines["PERLIDAR"])
     assert set(per_lidar) == {"front", "side"}
     assert all(count > 0 for count in per_lidar.values()), per_lidar
-    # Verified discriminating: zeroing the second LiDAR's t_lb takes this from
-    # ~0.011 m to ~0.21 m, so the bound is not merely "did not diverge".
+    # Bound extrinsic compensation error.
     assert float(lines["MAXDIST"]) < 0.05, "stationary rig drifted; check extrinsics handling"
 
 
@@ -421,13 +412,7 @@ def test_two_lidars_of_the_same_type_are_rejected():
     assert "invalid RespleConfig" in proc.stderr
 
 
-# A short sweep against a long knot interval: each 10 ms sweep is followed by a
-# 90 ms hole, and `knot_hz` 20 makes `dt_ns` 50 ms. `collectMeasurements()`
-# therefore reaches its spline-extension path -- `pt_min_time` past
-# `spline->maxTimeNs()` -- while the buffer holds a single short sweep, which is
-# exactly where the point-pop loop can drain `pt_buff` empty instead of stopping
-# on the timestamp bound. `num_points_upd` is raised so the pop is not capped
-# before it gets there; the default 100 masks the drain entirely.
+# Exercise sparse spline extension.
 _EXTENSION_COVERAGE_SCRIPT = textwrap.dedent("""
     import json
     from collections import deque
@@ -462,9 +447,7 @@ _EXTENSION_COVERAGE_SCRIPT = textwrap.dedent("""
             ))
             index += 1
             next_t += 1.0 / lidar_hz
-            # Every submission is followed by a synchronization boundary, so the
-            # worker is quiescent whenever a lag is recorded: `lag` is how many
-            # further sweeps had to be submitted before this one was consumed.
+            # Measure quiescent ticket lag.
             while unresolved and odom.synchronize(unresolved[0][0]):
                 lags.append(index - 1 - unresolved.popleft()[1])
     metrics = odom.finish()["metrics"]

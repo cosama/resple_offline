@@ -1,55 +1,8 @@
-src/RESPLE.cpp -- the RESPLE node itself.
+Bridge lifecycle and ticket hooks.
 
-One patch per upstream file, so this one patch carries every change the bridge
-makes to RESPLE.cpp regardless of concern. To keep that from hiding the "why",
-each hunk explains itself *in the source*, tagged `resple_bridge:` -- after
-patching, `grep -n 'resple_bridge:' src/RESPLE.cpp` enumerates the entire local
-delta with its rationale, in the staged file a reader is actually looking at.
-This header is only an index; the reasoning has one home, at the sites.
-
-1. Visibility. `private:` -> `public:` so cpp/bindings.cpp can inject sensor
-   data into RESPLE's own buffers and read spline state. No behavior change.
-2. Finish/synchronization condition. processData()'s `while (true)` gets a
-   state-based exit and publishes stable-blocked submission epochs while a
-   bridge-owned mutex makes each worker pass an explicit synchronization unit.
-   After publication the worker releases that mutex and honors an explicit
-   handoff request before it may start another pass, preventing lock starvation.
-3. Queue discipline and tickets. Pop under the queues' own mutex; notify the
-   bridge on every dequeue, and carry a sweep ticket through raw, downsampled,
-   discarded, initialization, and estimator-batch queues using lockstep
-   sidecars, checked with resple_bridge::check_invariant rather than assert
-   (the shipped build is Release, so assert would compile the checks out
-   exactly where a desynced sidecar becomes undefined behavior). Upstream
-   PointData and estimator APIs stay unchanged.
-4. Deterministic initialization(): LIO waits for the fixed 15-sample gravity
-   prefix, the initial map is built only from the *complete* fixed 100 ms
-   window, and propRCP(start_t_ns) moves below both retry gates so it runs
-   exactly once. These prevent initialization state from depending on how far
-   the producer ran before the worker. Single-LiDAR replay with sufficient IMU
-   lead never entered the retry path, so its trajectory is bit-identical.
-5. An actionable failure when a complete 100 ms window holds fewer than the
-   required 100 downsampled points; more input cannot change a closed window.
-6. Safe pre-initialization lifecycle. `spline` starts as nullptr rather than an
-   indeterminate pointer, so a starved session can finish and report no pose
-   instead of dereferencing garbage before initFilter assigns the real spline.
-7. An upstream out-of-bounds read: processData() takes pt_meas.back() on every
-   true return from collectMeasurements(), which also covers a pass that
-   discarded every point it popped and left pt_meas empty.
-8. Measurement composition deliberately remains upstream's. Offline
-   determinism comes from timestamp-ordered producer submission, atomic sweep
-   enqueue/dequeue, and explicit stable ticket boundaries. Additional IMU or
-   LiDAR extension gates change nonlinear filter batch composition throughout
-   a run; they do not merely remove a scheduling race. The worker's explicit
-   close/no-progress lifecycle then applies upstream's finite-buffer readiness
-   at end-of-stream without a custom gate stranding processable input.
-
-Hunks are generated with `diff -U3`, never hand-trimmed, except concern 8's
-single-condition replacement: its adjacent upstream closing lines contain
-trailing whitespace, so that hunk retains the two clean following context
-lines instead of copying whitespace into this patch. What `-F0` requires is an
-*exact* context match, not three lines of it, so the shortened hunk still
-applies at zero fuzz and zero offset; fewer context lines only narrow the
-evidence of drift, which is why this stays the single exception.
+The patch adds only offline access, synchronized queue handling, deterministic
+initialization, safe shutdown, and required bounds checks. Estimator math and
+measurement readiness remain upstream-owned.
 
 --- src/RESPLE.cpp
 +++ src/RESPLE.cpp
@@ -65,23 +18,23 @@ evidence of drift, which is why this stays the single exception.
          int64_t t_last_map_upd = 0;
 -        while (true) {      
 +        while (true) {
-+            // resple_bridge: one pass is the unit observed by synchronize().
-+            // Producers may continue submitting while it runs; the epoch is
-+            // sampled before any input queue is scanned.
++            // resple_bridge: define synchronization passes.
++            // Producers may submit concurrently.
++            // Snapshot before scanning input.
 +            std::unique_lock<std::mutex> processing_lock(bridge_processing_mutex);
 +            const std::uint64_t pass_submission_epoch =
 +                resple_bridge::current_submission_epoch();
-+            // Sampled before this pass scans any buffer -- see offline_bridge.hpp.
++            // Preserve the entry state.
 +            const bool closed_at_pass_start = resple_bridge::input_closed();
 +            bool made_progress = false;
              for (auto& [lidar_name, lidar_data] : lidars_data) {
 -                while (!lidar_data.t_buff.empty()) {
-+                // resple_bridge: emptiness is tested *inside* mtx_pc rather than
-+                // before taking it -- the bridge's producer pushes concurrently,
-+                // so a check outside the lock races the push it is checking for.
-+                // note_progress() below is what releases a producer parked in
-+                // push_lidar's backpressure wait, so it must fire on every real
-+                // dequeue, not once per pass.
++                // resple_bridge: lock queue inspection.
++                // Producers push concurrently here.
++                // Outside checks would race.
++                // Notify waiting producers promptly.
++                // Every dequeue makes progress.
++                // Backpressure needs each notification.
 +                while (true) {
                      pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_frame(new pcl::PointCloud<pcl::PointXYZINormal>());
 -                    lidar_data.mtx_pc.lock();
@@ -118,8 +71,8 @@ evidence of drift, which is why this stays the single exception.
  
                      ds_filter_body.setInputCloud(pc_frame);
                      ds_filter_body.filter(*pc_last_ds);
-+                    // resple_bridge: zero-point sweeps complete here; otherwise
-+                    // each downsampled point carries the sweep ticket onward.
++                    // resple_bridge: complete empty sweeps.
++                    // Propagate nonempty sweep tickets.
 +                    resple_bridge::note_raw_ingested(raw_ticket, pc_last_ds->points.size());
                      sort(pc_last_ds->points.begin(), pc_last_ds->points.end(), &CommonUtils::time_list);
                      const LidarConfig& lidar = lidars.at(lidar_name);
@@ -138,8 +91,8 @@ evidence of drift, which is why this stays the single exception.
 -                Eigen::aligned_vector<sensor_msgs::msg::Imu::SharedPtr> imu_buff_msg = imu_int_buff;
 -                imu_int_buff.clear();
 -                m_buff.unlock();
-+            // resple_bridge: swap under m_buff instead of copy-then-clear, and
-+            // record whether anything actually moved (see made_progress).
++            // resple_bridge: drain IMU atomically.
++            // Record moved input.
 +            if (!if_lidar_only) {
 +                Eigen::aligned_vector<sensor_msgs::msg::Imu::SharedPtr> imu_buff_msg;
 +                {
@@ -157,48 +110,48 @@ evidence of drift, which is why this stays the single exception.
                  }
              }
              if(!initialization()) {
-+                // resple_bridge: initialization() also returns false on the pass
-+                // that finishes both stages. Such a pass can make estimator
-+                // progress without new input, so publish a blocked epoch only
-+                // when initialization is genuinely awaiting input.
++                // resple_bridge: distinguish initialization progress.
++                // Completed stages may return false.
++                // Avoid premature blocked boundaries.
++                // Publish only genuine waits.
 +                const bool init_stable_blocked = !(if_init_filter && if_init_map);
 +                if (init_stable_blocked) {
 +                    resple_bridge::note_stable_blocked(pass_submission_epoch);
 +                }
-+                // resple_bridge: the offline finish condition. Upstream's loop is
-+                // `while (true)` -- a real ROS node is killed, never joined, so it
-+                // has no exit at all. Stop after the first pass that both *began*
-+                // with input closed and moved nothing. The flag is the one sampled
-+                // at the top of this pass, never re-read here: re-reading would
-+                // race a sweep pushed after this pass scanned the buffers.
-+                //
-+                // This cannot cut initialization short. Raw input is drained
-+                // into pt_buff/imu_buff above, in this same pass, before
-+                // initialization() is called -- so the pass on which
-+                // initialization can first succeed is necessarily one that
-+                // moved data, and made_progress is true there. Every reason
-+                // initialization() returns false early is "needs more input".
++                // resple_bridge: stop after draining.
++                // Require closed-at-entry input.
++                // Require a progress-free pass.
++                // Use the captured state.
++                // Re-reading could race producers.
++                // Initialization remains input-driven.
++                // Raw queues drain first.
++                // Initialization then consumes them.
++                // Successful initialization makes progress.
++                // Progress prevents early shutdown.
++                // Failed initialization needs input.
++                // Closed input cannot provide it.
++                // Finish at that boundary.
 +                if (closed_at_pass_start && !made_progress) {
 +                    break;
 +                }
 +                processing_lock.unlock();
 +                if (init_stable_blocked) {
-+                    // resple_bridge: hand the released pass mutex to an explicit
-+                    // synchronize() waiter before this worker can reacquire it.
++                    // resple_bridge: prioritize boundary waiters.
++                    // Prevent worker lock starvation.
 +                    resple_bridge::wait_for_synchronization_release(pass_submission_epoch);
 +                }
                  rate.sleep();
                  continue;
              }
              while (collectMeasurements()) {
-+                made_progress = true;  // resple_bridge: a formed batch is progress
-+                // resple_bridge: upstream reads pt_meas.back() unconditionally,
-+                // but collectMeasurements() returns true whenever it consumed
-+                // anything -- including a pass whose every popped point was
-+                // dropped as older than the active spline window, which leaves
-+                // pt_meas empty and the read undefined. Those points are already
-+                // acknowledged as discarded on their way out, so there is
-+                // nothing to update from: take the next batch.
++                made_progress = true;  // resple_bridge: record formed batches
++                // resple_bridge: guard empty batches.
++                // Collection may only discard.
++                // Discarded points leave nothing.
++                // Accessing back would fail.
++                // Discards are already acknowledged.
++                // No estimator update remains.
++                // Continue collecting available batches.
 +                if (pt_meas.empty()) {
 +                    continue;
 +                }
@@ -219,28 +172,28 @@ evidence of drift, which is why this stays the single exception.
                      accum_nearest_points.clear();
                      t_last_map_upd = max_time_ns;
                  }
-+                // resple_bridge: acknowledge only after every operation in this
-+                // measurement batch, including any map update/publication, has
-+                // succeeded. Keeping the ticket sidecar does not change the
-+                // upstream pt_meas lifetime or force the conditional map path.
++                // resple_bridge: acknowledge completed batches.
++                // Include map updates first.
++                // Preserve measurement lifetime.
++                // Preserve conditional map behavior.
 +                for (const std::uint64_t ticket : pt_meas_ticket_buff) {
 +                    resple_bridge::note_point_processed(ticket);
 +                }
 +                pt_meas_ticket_buff.clear();
              }                      
-+            // resple_bridge: raw inputs were drained and collectMeasurements()
-+            // cannot form another batch. Publish the epoch sampled before this
-+            // pass scanned input while still holding bridge_processing_mutex.
++            // resple_bridge: publish drained boundaries.
++            // No batch remains ready.
++            // Keep processing lock held.
 +            resple_bridge::note_stable_blocked(pass_submission_epoch);
-+            // resple_bridge: same finish condition as above, for a pass that got
-+            // as far as the estimator. Both exits are needed: initialization()
-+            // returning false skips the loop entirely.
++            // resple_bridge: stop drained estimators.
++            // Initialization needs its own exit.
++            // Both paths must finish.
 +            if (closed_at_pass_start && !made_progress) {
 +                break;
 +            }
 +            processing_lock.unlock();
-+            // resple_bridge: an absent synchronization request returns
-+            // immediately; a matching one owns the boundary before next pass.
++            // resple_bridge: honor pending boundaries.
++            // Otherwise continue immediately.
 +            resple_bridge::wait_for_synchronization_release(pass_submission_epoch);
          }
      }    
@@ -248,11 +201,11 @@ evidence of drift, which is why this stays the single exception.
      EIGEN_MAKE_ALIGNED_OPERATOR_NEW
  
 -private:
-+public:  // resple_bridge: widened from private so the offline bridge can
-+         // inject sensor data directly into RESPLE's own per-lidar buffers
-+         // and IMU queue (the same ones its ROS callbacks would fill under
-+         // real ROS) and call processData()/initialization() directly.
-+         // No behavior below this line is changed. See cpp/bindings.cpp.
++public:  // resple_bridge: allow offline injection
++         // Access native sensor queues.
++         // Access the estimator state.
++         // Drive processing directly.
++         // Preserve estimator behavior.
  
      std::string node_name = "RESPLE";
      rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_ouster;
@@ -260,16 +213,16 @@ evidence of drift, which is why this stays the single exception.
      struct LidarData {
          Eigen::aligned_deque<Eigen::aligned_vector<pcl::PointXYZINormal>> pc_buff;
          std::deque<int64_t> t_buff;
-+        std::deque<std::uint64_t> raw_ticket_buff;  // resple_bridge: raw sidecar
++        std::deque<std::uint64_t> raw_ticket_buff;  // resple_bridge: track raw tickets
          std::mutex mtx_pc;
          Eigen::aligned_deque<PointData> pt_buff;
-+        std::deque<std::uint64_t> pt_ticket_buff;   // resple_bridge: point sidecar
++        std::deque<std::uint64_t> pt_ticket_buff;   // resple_bridge: track point tickets
      };
      std::map<std::string, LidarData> lidars_data;    
      Eigen::aligned_deque<PointData> pt_meas;    
-+    std::deque<std::uint64_t> pt_meas_ticket_buff;  // resple_bridge: batch sidecar
-+    // Held for one complete worker pass and by synchronize() while it places
-+    // the explicit ikd-tree quiescence barrier.
++    std::deque<std::uint64_t> pt_meas_ticket_buff;  // resple_bridge: track batch tickets
++    // Serialize processing and synchronization.
++    // Keep tree boundaries quiescent.
 +    std::mutex bridge_processing_mutex;
  
      bool if_lidar_only;
@@ -279,7 +232,7 @@ evidence of drift, which is why this stays the single exception.
      Estimator<24> estimator_lo;
      Estimator<30> estimator_lio;
 -    SplineState* spline;
-+    SplineState* spline = nullptr;  // resple_bridge: safe before initFilter
++    SplineState* spline = nullptr;  // resple_bridge: support pre-init shutdown
      double cov_P0 = 0.02;
      double cov_RCP_pos_old = 0.02;
      double cov_RCP_ort_old = 0.02;
@@ -287,11 +240,11 @@ evidence of drift, which is why this stays the single exception.
              start_t_ns = std::min(start_t_ns, std::max(lidar_data.pt_buff.front().time_ns, int64_t(0)));
          }        
          if (!if_init_filter) {
-+            // resple_bridge: gravity is defined by a fixed 15-sample prefix.
-+            // Accepting a shorter prefix makes orientation depend on producer/
-+            // worker scheduling, and zero samples divides by zero below. Wait
-+            // for more IMU instead; synchronize(ticket) then reports the stable
-+            // incomplete boundary without rejecting the already queued LiDAR.
++            // resple_bridge: require fixed gravity input.
++            // Short prefixes vary by scheduling.
++            // Empty prefixes divide by zero.
++            // Wait for sufficient IMU.
++            // Preserve queued LiDAR input.
 +            if (!if_lidar_only && imu_buff.size() < 15) {
 +                return false;
 +            }
@@ -308,7 +261,7 @@ evidence of drift, which is why this stays the single exception.
 -                estimator_lio.propRCP(start_t_ns);
 -            }
              int feats_down_size = 0;
-+            bool init_window_complete = true;  // resple_bridge: gate below
++            bool init_window_complete = true;  // resple_bridge: require complete window
              for (const auto& [lidar_name, lidar_data] : lidars_data) {
 +                init_window_complete = init_window_complete &&
 +                    lidar_data.pt_buff.back().time_ns >= start_t_ns + 1e8;
@@ -319,9 +272,9 @@ evidence of drift, which is why this stays the single exception.
                  }
              }            
              if(feats_down_size < 100) {
-+                // resple_bridge: a complete window that is still too sparse can
-+                // never be fixed by more input -- fail now, not after buffering
-+                // the whole dataset.
++                // resple_bridge: reject sparse windows.
++                // Later input cannot help.
++                // Avoid unbounded buffering.
 +                if (init_window_complete) {
 +                    throw std::runtime_error(
 +                        "RESPLE initial-map initialization cannot proceed: first 100 ms contains " +
@@ -334,29 +287,29 @@ evidence of drift, which is why this stays the single exception.
                  return false;
 -            }            
 +            }
-+            // resple_bridge: the initial map must be a function of the input,
-+            // not of how far
-+            // the producer happened to run before this pass reached here.
-+            // Upstream counts whatever is buffered and commits as soon as 100
-+            // points are present, so a partially arrived window would seed the
-+            // ikd-tree -- and every later correspondence -- differently on
-+            // every replay. Waiting only delays: the window is a fixed time
-+            // range, so the retry sees the same points plus the rest of them.
-+            // A window that never completes means every LiDAR's data ends
-+            // within 100 ms of start_t_ns -- a broken input, which then
-+            // surfaces as an empty trajectory with non-zero residual_sweeps
-+            // rather than a map seeded from a fragment.
++            // resple_bridge: require complete map input.
++            // Ignore producer scheduling distance.
++            // Partial windows vary initialization.
++            // Buffered counts arrive incrementally.
++            // Early commits vary tree seeds.
++            // Correspondences inherit that variance.
++            // Waiting preserves fixed membership.
++            // Retries only complete windows.
++            // Missing tails remain incomplete.
++            // Residual metrics expose them.
++            // Never seed from fragments.
++            // Return the stable boundary.
 +            if (!init_window_complete) {
 +                return false;
 +            }
-+            // resple_bridge: moved below the two retry gates above, so that it
-+            // runs exactly once.
-+            // propRCP inflates the recursive-control-point covariance on every
-+            // call (`cov_rcp += cov_sys` when the spline already covers t), so
-+            // running it on each retry pass would make the initial filter
-+            // covariance -- and therefore the first IEKF gain and the whole
-+            // trajectory -- depend on how many passes the window took to
-+            // arrive, which is producer/worker scheduling.
++            // resple_bridge: propagate exactly once.
++            // Retry gates precede propagation.
++            // Repetition inflates filter covariance.
++            // Inflation changes the initial gain.
++            // Initial gain affects trajectory.
++            // Retry counts reflect scheduling.
++            // Scheduling must not affect output.
++            // Propagate after input completion.
 +            if (if_lidar_only) {
 +                estimator_lo.propRCP(start_t_ns);
 +            } else {
@@ -385,9 +338,9 @@ evidence of drift, which is why this stays the single exception.
 +                    "point queue desynced from its ticket sidecar after initial-map pop");
              }            
              ikdtree.Build(pc_world.points); 
-+            // resple_bridge: initialization points complete only after the map
-+            // build succeeds; acknowledging while popping would expose a false
-+            // completed boundary if Build threw or failed.
++            // resple_bridge: acknowledge successful builds.
++            // Popping alone is insufficient.
++            // Failed builds remain incomplete.
 +            for (const std::uint64_t ticket : init_tickets) {
 +                resple_bridge::note_point_processed(ticket);
 +            }
@@ -417,9 +370,9 @@ evidence of drift, which is why this stays the single exception.
                      pt_meas.emplace_back(lidar_data.pt_buff.front());
 +                    pt_meas_ticket_buff.push_back(lidar_data.pt_ticket_buff.front());
 +                } else {
-+                    // resple_bridge: upstream deliberately drops points older
-+                    // than its active spline window; they are terminal, not
-+                    // residual input waiting for a future estimator batch.
++                    // resple_bridge: acknowledge stale points.
++                    // They cannot reenter batches.
++                    // They are not residuals.
 +                    resple_bridge::note_point_processed(lidar_data.pt_ticket_buff.front());
                  }
                  lidar_data.pt_buff.pop_front();

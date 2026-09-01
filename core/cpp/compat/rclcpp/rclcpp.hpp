@@ -1,8 +1,6 @@
 #pragma once
 
-// Minimal rclcpp surface used by the offline bridge. Subscriptions are no-ops,
-// publishers forward to capture callbacks, and Node stores typed parameters.
-// Rate uses a short polling delay so replay is not throttled to wall-clock time.
+// Provide required ROS surfaces.
 
 #include <any>
 #include <atomic>
@@ -35,7 +33,7 @@ class Publisher {
     if (slot) slot(message);
   }
 
-  // RESPLE publishes at most one topic of each captured message type.
+  // Capture one publisher per type.
   static std::function<void(const MsgT&)>& capture_slot() {
     static std::function<void(const MsgT&)> slot;
     return slot;
@@ -52,14 +50,14 @@ class Node {
 
   explicit Node(std::string) {}
 
-  // --- Bridge-facing: seed real values before RESPLE's constructor runs ---
+  // Seed typed parameters.
   template <typename T>
   void set_parameter(const std::string& key, const T& value) {
     std::lock_guard<std::mutex> lock(mutex_);
     params_[key] = value;
   }
 
-  // --- rclcpp::Node parameter surface RESPLE.cpp/CommonUtils::readParam use ---
+  // Serve typed parameters.
   bool has_parameter(const std::string& key) const {
     std::lock_guard<std::mutex> lock(mutex_);
     return params_.count(key) != 0;
