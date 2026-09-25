@@ -1,0 +1,11 @@
+--- src/RESPLE.cpp
++++ src/RESPLE.cpp
+@@ -310,7 +310,7 @@
+         Q.topLeftCorner<6, 6>() = Q_block_old;
+         Q.block<6, 6>(6, 6) = Q_block_old;
+         Q.block<6, 6>(12, 12) = Q_block_old;
+-        Q.bottomRightCorner<6, 6>() = Q_block_new;  
++        Q.block<6, 6>(18, 18) = Q_block_new;
+         if (if_lidar_only) {
+             estimator_lo.setState(dt_ns, start_t_ns, t_init, q_init, Q.topLeftCorner<24, 24>(), cov_RCPs);  
+             spline = estimator_lo.getSpline();

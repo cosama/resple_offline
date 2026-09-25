@@ -1,5 +1,8 @@
 # Known issues
 
+See [TUNING.md](TUNING.md) for the validated general core, dataset exceptions,
+and experiment design guidance.
+
 ## Heterogeneous-core divergence
 
 H420 replay depends on Intel core class. Two P-core runs reproduce one exact

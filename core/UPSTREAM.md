@@ -75,8 +75,11 @@ tree rebuild without a wall-clock cutoff.
 |---|---|
 | `01-resple-node.patch` | Adds offline lifecycle, queue locking, tickets, deterministic initialization, safe shutdown, and required bounds checks. |
 | `02-ikd-tree.patch` | Exposes rebuild quiescence at explicit host boundaries. |
+| `03-relocate-new-knot-noise.patch` | Fixes upstream's new-control-point process-noise block being written over the IMU-bias states instead of spline state indices 18–23. |
 
-Patches must not change estimator math or upstream measurement readiness.
+Estimator-math patches require an isolated upstream defect, a focused source
+contract, and real-data validation. Measurement-readiness changes require
+separate scheduling and input-conservation validation.
 
 ## Validation limits
 
