@@ -1,9 +1,3 @@
-Bridge lifecycle and ticket hooks.
-
-The patch adds only offline access, synchronized queue handling, deterministic
-initialization, safe shutdown, and required bounds checks. Estimator math and
-measurement readiness remain upstream-owned.
-
 --- src/RESPLE.cpp
 +++ src/RESPLE.cpp
 @@ -1,4 +1,5 @@
@@ -12,7 +6,7 @@ measurement readiness remain upstream-owned.
  #include <std_msgs/msg/int64.hpp>
  #include <std_msgs/msg/bool.hpp>
  #include <sensor_msgs/msg/imu.hpp>
-@@ -86,35 +87,71 @@ public:
+@@ -86,35 +87,71 @@
          rclcpp::Rate rate(20);
          int64_t max_spl_knots = 0;
          int64_t t_last_map_upd = 0;
@@ -97,7 +91,7 @@ measurement readiness remain upstream-owned.
                  for (size_t i = 0; i < imu_buff_msg.size(); i++) {
                      const auto imu_msg = imu_buff_msg[i];
                      int64_t t_ns = rclcpp::Time(imu_msg->header.stamp).nanoseconds();
-@@ -126,10 +163,29 @@ public:
+@@ -126,10 +163,29 @@
                  }
              }
              if(!initialization()) {
@@ -127,7 +121,7 @@ measurement readiness remain upstream-owned.
                  int64_t max_time_ns = pt_meas.back().time_ns;
                  if (if_lidar_only) {
                      estimator_lo.propRCP(max_time_ns);
-@@ -154,6 +210,9 @@ public:
+@@ -154,6 +210,9 @@
                      pc_world.points.push_back(pt_data.pt_w);
                      accum_nearest_points.push_back(pt_data.nearest_points);
                  }
@@ -137,7 +131,7 @@ measurement readiness remain upstream-owned.
                  pt_meas.clear();
                  if (spline->numKnots() > max_spl_knots) {
                      estimate_msgs::msg::Spline spline_msg;
-@@ -173,13 +232,27 @@ public:
+@@ -173,13 +232,27 @@
                      accum_nearest_points.clear();
                      t_last_map_upd = max_time_ns;
                  }
@@ -166,7 +160,7 @@ measurement readiness remain upstream-owned.
  
      std::string node_name = "RESPLE";
      rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_ouster;
-@@ -214,11 +287,16 @@ private:
+@@ -214,11 +287,16 @@
      struct LidarData {
          Eigen::aligned_deque<Eigen::aligned_vector<pcl::PointXYZINormal>> pc_buff;
          std::deque<int64_t> t_buff;
@@ -183,7 +177,7 @@ measurement readiness remain upstream-owned.
  
      bool if_lidar_only;
      rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu;
-@@ -234,7 +312,7 @@ private:
+@@ -234,7 +312,7 @@
      bool if_init_filter = false;
      Estimator<24> estimator_lo;
      Estimator<30> estimator_lio;
@@ -192,9 +186,88 @@ measurement readiness remain upstream-owned.
      double cov_P0 = 0.02;
      double cov_RCP_pos_old = 0.02;
      double cov_RCP_ort_old = 0.02;
-@@ -623,6 +701,10 @@ private:
+@@ -621,8 +699,88 @@
+         int64_t start_t_ns = std::numeric_limits<int64_t>::max();
+         for (const auto& [lidar_name, lidar_data] : lidars_data) {
              start_t_ns = std::min(start_t_ns, std::max(lidar_data.pt_buff.front().time_ns, int64_t(0)));
-         }        
+-        }        
++        }
++
++        // resple_bridge: require complete window
++        bool init_window_complete = true;
++        for (const auto& [lidar_name, lidar_data] : lidars_data) {
++            init_window_complete = init_window_complete &&
++                lidar_data.pt_buff.back().time_ns >= start_t_ns + 1e8;
++        }
++        if (!init_window_complete) {
++            if (resple_bridge::input_closed()) {
++                throw std::runtime_error(
++                    "RESPLE initial-map initialization cannot proceed: dataset finished without any complete "
++                    "100 ms window (ds_scan_voxel=" + std::to_string(ds_filter_body.getLeafSize()[0]) +
++                    ", point_filter_num=" + std::to_string(point_filter_num) + ").");
++            }
++            return false;
++        }
++
++        int feats_down_size = 0;
++        for (const auto& [lidar_name, lidar_data] : lidars_data) {
++            for (size_t i = 0; i < lidar_data.pt_buff.size(); i++) {
++                if (lidar_data.pt_buff[i].time_ns < start_t_ns + 1e8) {
++                    feats_down_size++;
++                } else {
++                    break;
++                }
++            }
++        }
++
++        if (feats_down_size < 100) {
++            if (resple_bridge::input_closed()) {
++                throw std::runtime_error(
++                    "RESPLE initial-map initialization cannot proceed: no 100 ms window contained "
++                    "at least 100 points after scan downsampling (ds_scan_voxel=" +
++                    std::to_string(ds_filter_body.getLeafSize()[0]) +
++                    ", point_filter_num=" + std::to_string(point_filter_num) + "). "
++                    "Use a smaller ds_scan_voxel/point_filter_num or change the initialization policy.");
++            }
++
++            static int64_t last_warn_t_ns = 0;
++            static int skipped_windows = 0;
++            skipped_windows++;
++            if (last_warn_t_ns == 0 || (start_t_ns - last_warn_t_ns) >= int64_t(1e9)) {
++                RCLCPP_WARN_STREAM(this->get_logger(),
++                    "RESPLE initial-map: first 100 ms contains " << feats_down_size
++                    << " points after scan downsampling, but at least 100 are required (ds_scan_voxel="
++                    << ds_filter_body.getLeafSize()[0] << ", point_filter_num=" << point_filter_num
++                    << "). Skipping sparse window(s) and retrying with next window...");
++                last_warn_t_ns = start_t_ns;
++                skipped_windows = 0;
++            }
++
++            for (auto& [lidar_name, lidar_data] : lidars_data) {
++                resple_bridge::check_invariant(
++                    lidar_data.pt_buff.size() == lidar_data.pt_ticket_buff.size(),
++                    "point queue desynced from its ticket sidecar entering sparse initial-map pop");
++                while (!lidar_data.pt_buff.empty() && lidar_data.pt_buff.front().time_ns < start_t_ns + 1e8) {
++                    resple_bridge::note_point_processed(lidar_data.pt_ticket_buff.front());
++                    lidar_data.pt_buff.pop_front();
++                    lidar_data.pt_ticket_buff.pop_front();
++                }
++                resple_bridge::check_invariant(
++                    lidar_data.pt_buff.size() == lidar_data.pt_ticket_buff.size(),
++                    "point queue desynced from its ticket sidecar after sparse initial-map pop");
++            }
++            if (!if_lidar_only) {
++                m_buff.lock();
++                while (imu_buff.size() > 30 && imu_buff.front().time_ns < start_t_ns) {
++                    imu_buff.pop_front();
++                }
++                m_buff.unlock();
++            }
++            resple_bridge::note_progress();
++            return false;
++        }
++
++        // Window has >= 100 points! Initialize filter first.
          if (!if_init_filter) {
 +            // Require sufficient gravity input.
 +            if (!if_lidar_only && imu_buff.size() < 15) {
@@ -203,54 +276,39 @@ measurement readiness remain upstream-owned.
              Eigen::Quaterniond q_WI = Eigen::Quaterniond::Identity();   
              if (!if_lidar_only) {
                  Eigen::Vector3d gravity_sum(0, 0, 0);
-@@ -655,13 +737,11 @@ private:
+@@ -651,28 +809,17 @@
+             start_time.data = start_t_ns;
+             pub_start_time->publish(start_time);    
+         }
++
+         if (!if_init_map) {
              if(ikdtree.Root_Node == nullptr) {
                  ikdtree.set_downsample_param(ds_lm_voxel);
              }
--            if (if_lidar_only) {
--                estimator_lo.propRCP(start_t_ns);  
--            } else {
--                estimator_lio.propRCP(start_t_ns);
--            }
-             int feats_down_size = 0;
-+            bool init_window_complete = true;  // resple_bridge: require complete window
-             for (const auto& [lidar_name, lidar_data] : lidars_data) {
-+                init_window_complete = init_window_complete &&
-+                    lidar_data.pt_buff.back().time_ns >= start_t_ns + 1e8;
-                 for (size_t i = 0; i < lidar_data.pt_buff.size(); i++) {
-                     if (lidar_data.pt_buff[i].time_ns < start_t_ns + 1e8) {
-                         feats_down_size++;
-@@ -671,8 +751,28 @@ private:
-                 }
-             }            
-             if(feats_down_size < 100) {
-+                // Reject closed sparse windows.
-+                if (init_window_complete) {
-+                    throw std::runtime_error(
-+                        "RESPLE initial-map initialization cannot proceed: first 100 ms contains " +
-+                        std::to_string(feats_down_size) +
-+                        " points after scan downsampling, but at least 100 are required "
-+                        "(ds_scan_voxel=" + std::to_string(ds_filter_body.getLeafSize()[0]) +
-+                        ", point_filter_num=" + std::to_string(point_filter_num) + "). "
-+                        "Use a smaller ds_scan_voxel/point_filter_num or change the initialization policy.");
-+                }
-                 return false;
--            }            
-+            }
-+            // Require complete initialization input.
-+            if (!init_window_complete) {
-+                return false;
-+            }
 +            // Propagate once after readiness.
-+            if (if_lidar_only) {
+             if (if_lidar_only) {
+-                estimator_lo.propRCP(start_t_ns);  
 +                estimator_lo.propRCP(start_t_ns);
-+            } else {
-+                estimator_lio.propRCP(start_t_ns);
-+            }
+             } else {
+                 estimator_lio.propRCP(start_t_ns);
+             }
+-            int feats_down_size = 0;
+-            for (const auto& [lidar_name, lidar_data] : lidars_data) {
+-                for (size_t i = 0; i < lidar_data.pt_buff.size(); i++) {
+-                    if (lidar_data.pt_buff[i].time_ns < start_t_ns + 1e8) {
+-                        feats_down_size++;
+-                    } else {
+-                        break;
+-                    }
+-                }
+-            }            
+-            if(feats_down_size < 100) {
+-                return false;
+-            }            
              pc_world.clear();
              pc_world.resize(feats_down_size); 
              int world_i = 0;
-@@ -687,12 +787,26 @@ private:
+@@ -687,24 +834,42 @@
                      }
                  }
              }
@@ -276,8 +334,15 @@ measurement readiness remain upstream-owned.
 +            }
              pc_world.clear();
              if_init_map = true;
++            RCLCPP_INFO_STREAM(this->get_logger(),
++                "RESPLE initial map successfully initialized with " << feats_down_size << " points.");
          }       
-@@ -705,6 +819,9 @@ private:
+         return false; 
+     }
+-
+     bool collectMeasurements()
+     {
+         rclcpp::Rate rate(20);
          int64_t pt_min_time = std::numeric_limits<int64_t>::max();
          int64_t pt_max_time = std::numeric_limits<int64_t>::max();            
          for (const auto& [lidar_name, lidar_data] : lidars_data) {
@@ -287,7 +352,7 @@ measurement readiness remain upstream-owned.
              if (lidar_data.pt_buff.empty()) {
                  rate.sleep();
                  return false;
-@@ -734,15 +851,29 @@ private:
+@@ -734,15 +899,29 @@
          }
          int cnt = 0;
          for (auto& [lidar_name, lidar_data] : lidars_data) {

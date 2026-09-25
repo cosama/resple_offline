@@ -57,6 +57,51 @@ _SPARSE_INITIAL_MAP_SCRIPT = textwrap.dedent("""
     run_stationary_session(odom)
 """)
 
+_SPARSE_PREFIX_SCRIPT = textwrap.dedent("""
+    import numpy as np
+    from collections import deque
+    from resple import RespleOdometry, config as cfgmod
+    from tests.synthetic import box_room_sweep, GRAVITY, IMU_LEAD_SECONDS
+
+    cfg = cfgmod.resolve({"lidars": [{
+        "name": "lidar0", "lidar_type": "Ouster", "scan_line": 64, "blind": 0.3,
+        "q_lb": (1.0, 0.0, 0.0, 0.0), "t_lb": (0.0, 0.0, 0.0), "w_pt": 0.01,
+    }]})
+    odom = RespleOdometry(cfg)
+    position = np.zeros(3)
+    unresolved = deque()
+    duration = 2.0
+    imu_hz = 200.0
+    lidar_hz = 10.0
+    next_lidar_t = 0.0
+    sweep_index = 0
+    n_imu = int(duration * imu_hz) + 50
+    for i in range(n_imu):
+        stamp = i / imu_hz
+        odom.push_imu(stamp, [0.0, 0.0, GRAVITY], [0.0, 0.0, 0.0])
+        if i == 14:
+            assert odom.synchronize()
+        while next_lidar_t <= stamp - IMU_LEAD_SECONDS and next_lidar_t < duration:
+            if sweep_index < 5:
+                # Sparse sweep: only 5 points
+                points = np.zeros((5, 3), dtype=np.float32)
+                points[:, 0] = np.linspace(1.0, 2.0, 5)
+                relative_times = np.zeros(5, dtype=np.float64)
+            else:
+                # Dense sweep
+                points, relative_times = box_room_sweep(
+                    position, n_azimuth=120, n_rings=8, seed=sweep_index
+                )
+            unresolved.append(odom.push_lidar(next_lidar_t, points, relative_times, lidar="lidar0"))
+            sweep_index += 1
+            next_lidar_t += 1.0 / lidar_hz
+            while unresolved and odom.synchronize(unresolved[0]):
+                unresolved.popleft()
+    res = odom.finish()
+    print("POSES", res["trajectory"].shape[0])
+    print("FINITE", bool(np.isfinite(res["trajectory"]).all()))
+""")
+
 _LIDAR_ONLY_SCRIPT = textwrap.dedent("""
     import numpy as np
     from resple import RespleOdometry, config as cfgmod
@@ -198,6 +243,19 @@ def test_sparse_initial_map_fails_with_actionable_error():
     assert "first 100 ms contains" in proc.stderr
     assert "ds_scan_voxel=100.000000" in proc.stderr
     assert "point_filter_num=1" in proc.stderr
+
+
+def test_sparse_prefix_is_skipped_and_initializes_on_dense_data():
+    proc = subprocess.run(
+        [sys.executable, "-c", _SPARSE_PREFIX_SCRIPT],
+        cwd=CORE_DIR, capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "Skipping sparse window(s) and retrying" in proc.stderr
+    assert "RESPLE initial map successfully initialized" in proc.stderr
+    lines = dict(line.split(" ", 1) for line in proc.stdout.splitlines() if " " in line)
+    assert int(lines["POSES"]) > 0
+    assert lines["FINITE"] == "True"
 
 
 def test_upstream_lidar_only_mode_commits_finite_poses():
