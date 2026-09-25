@@ -7,7 +7,10 @@ name = "resple-offline"
 version = "0.1.0"
 description = "Offline pybind11 bridge for the pinned upstream RESPLE estimator"
 requires-python = ">=3.10"
-dependencies = ["numpy"]
+dependencies = [
+    "numpy",
+    "ruamel.yaml",
+]
 
 [tool.scikit-build]
 cmake.build-type = "Release"

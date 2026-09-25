@@ -26,7 +26,7 @@ COPY upstream /src/upstream
 
 RUN python3 -m venv /opt/build-venv \
     && /opt/build-venv/bin/pip install --no-cache-dir --upgrade pip wheel \
-    && /opt/build-venv/bin/pip wheel --no-cache-dir --wheel-dir /wheelhouse ./core
+    && /opt/build-venv/bin/pip wheel --no-cache-dir --wheel-dir /wheelhouse ./core "rosbags>=0.11" "ruamel.yaml"
 
 FROM ubuntu:${UBUNTU_VERSION} AS runtime
 
@@ -47,9 +47,9 @@ RUN apt-get update \
 COPY --from=builder /wheelhouse /wheelhouse
 
 RUN python3 -m venv /opt/resple \
-    && /opt/resple/bin/pip install --no-cache-dir --no-index --find-links=/wheelhouse resple-offline \
+    && /opt/resple/bin/pip install --no-cache-dir --no-index --find-links=/wheelhouse resple-offline rosbags ruamel.yaml \
     && rm -rf /wheelhouse
 
 WORKDIR /data
 
-CMD ["python", "-c", "import resple; print('resple-offline ready')"]
+CMD ["python", "-c", "import resple, rosbags; from ruamel.yaml import YAML; print('resple-offline ready')"]
