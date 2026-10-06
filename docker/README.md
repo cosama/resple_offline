@@ -6,6 +6,12 @@ both `core/` and the pinned source under `upstream/`.
 From the `slam_benchmark` repository root:
 
 ```bash
+frameworks/resple/docker/build.sh
+```
+
+Or manually:
+
+```bash
 docker build \
   -f frameworks/resple/docker/Dockerfile \
   -t resple-offline \
