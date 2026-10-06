@@ -130,11 +130,12 @@ _SYNCHRONIZATION_SCRIPT = textwrap.dedent("""
     }]})
     odom = RespleOdometry(cfg)
     points0, times0 = box_room_sweep(np.zeros(3), seed=0)
-    ticket1 = odom.push_lidar(0.0, points0, times0)
-    print("TICKET", ticket1)
-    print("NO_IMU", odom.synchronize(ticket1))
+    print("PRE_IMU", odom.push_lidar(-0.1, points0, times0))
     for i in range(15):
         odom.push_imu(i / 200.0, [0.0, 0.0, 9.81], [0.0, 0.0, 0.0])
+    ticket1 = odom.push_lidar(0.0, points0, times0)
+    print("TICKET", ticket1)
+    print("DROPPED", odom.metrics()["sweeps_dropped_before_imu"])
     print("BLOCKED_SNAPSHOT", odom.synchronize())
     print("NO_LOOKAHEAD", odom.synchronize(ticket1))
     points1, times1 = box_room_sweep(np.zeros(3), seed=1)
@@ -280,8 +281,9 @@ def _run_inline(script: str, timeout: int = 60) -> dict[str, str]:
 
 def test_explicit_synchronization_reports_missing_input_then_completes_prefix():
     lines = _run_inline(_SYNCHRONIZATION_SCRIPT)
+    assert lines["PRE_IMU"] == "None"  # dropped before gravity initialization
     assert lines["TICKET"] == "1"
-    assert lines["NO_IMU"] == "False"
+    assert lines["DROPPED"] == "1"
     assert lines["BLOCKED_SNAPSHOT"] == "False"
     assert lines["NO_LOOKAHEAD"] == "False"
     assert lines["TICKET2"] == "2"

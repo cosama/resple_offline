@@ -11,6 +11,12 @@ from ._core import RespleOdometry as _RespleOdometry
 
 __all__ = ["RespleOdometry", "config"]
 
+# Upstream initialization() averages min(15, buffered IMU) samples for gravity
+# (RESPLE.cpp) and divides by zero without IMU. Sweeps arriving before this
+# many IMU samples are dropped rather than buffered, so the filter never
+# starts before IMU coverage.
+_MIN_IMU_FOR_INIT = 15
+
 
 class RespleOdometry:
     """Run one isolated RESPLE session."""
@@ -43,6 +49,8 @@ class RespleOdometry:
         )
         self._staged_imu: list[tuple[float, list[float], list[float]]] = []
         self._imu_pushed_count: int = 0
+        self._imu_ready: bool = cfg.if_lidar_only
+        self._sweeps_dropped_before_imu: int = 0
         self._unresolved_tickets: collections.deque[int] = collections.deque()
         self._previous_submitted_ticket: int | None = None
         self._latest_submitted_ticket: int = 0
@@ -99,13 +107,24 @@ class RespleOdometry:
         lines: np.ndarray | None = None,
         tags: np.ndarray | None = None,
         lidar: str | None = None,
-    ) -> int:
+    ) -> int | None:
         """Push one profiled LiDAR sweep.
 
         Points use XYZ or XYZI columns. Relative times use seconds. Raw Livox
         input should include lines and tags. Multi-LiDAR sessions require the
-        profile name and input from every configured stream.
+        profile name and input from every configured stream. Returns the
+        sweep's ticket, or None when the sweep was dropped because fewer than
+        15 IMU samples precede it.
         """
+        if not self._imu_ready:
+            if self._imu_pushed_count < _MIN_IMU_FOR_INIT:
+                self._sweeps_dropped_before_imu += 1
+                return None
+            # Make the worker absorb the IMU before it ever sees a sweep.
+            self._flush_staged_imu()
+            self._native.synchronize()
+            self._imu_ready = True
+
         self._flush_staged_imu()
         points = np.ascontiguousarray(points, dtype=np.float32)
         relative_times = np.ascontiguousarray(relative_times, dtype=np.float64)
@@ -182,7 +201,9 @@ class RespleOdometry:
         return self._native.drain_map_batches()
 
     def metrics(self) -> dict:
-        return self._native.metrics()
+        metrics = self._native.metrics()
+        metrics["sweeps_dropped_before_imu"] = self._sweeps_dropped_before_imu
+        return metrics
 
     def events(self) -> list[dict]:
         return self._native.events()
@@ -196,7 +217,9 @@ class RespleOdometry:
         while self._unresolved_tickets:
             ticket = self._unresolved_tickets.popleft()
             self._native.synchronize(ticket)
-        return self._native.finish()
+        result = self._native.finish()
+        result["metrics"]["sweeps_dropped_before_imu"] = self._sweeps_dropped_before_imu
+        return result
 
     def __enter__(self) -> "RespleOdometry":
         return self
