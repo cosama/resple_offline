@@ -26,7 +26,7 @@ COPY upstream /src/upstream
 
 RUN python3 -m venv /opt/build-venv \
     && /opt/build-venv/bin/pip install --no-cache-dir --upgrade pip wheel \
-    && /opt/build-venv/bin/pip wheel --no-cache-dir --wheel-dir /wheelhouse ./core "rosbags>=0.11" "ruamel.yaml"
+    && /opt/build-venv/bin/pip wheel --no-cache-dir --wheel-dir /wheelhouse ./core "rosbags>=0.11,!=0.11.6" "ruamel.yaml"
 
 FROM ubuntu:${UBUNTU_VERSION} AS runtime
 
